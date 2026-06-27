@@ -1,0 +1,24 @@
+{
+  "name": "job-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first, zero-budget daily job hunter (LinkedIn guest + Naukri guest + free APIs) with reverse-ATS résumé scoring.",
+  "scripts": {
+    "daily": "tsx src/index.ts",
+    "daily:dry": "tsx src/index.ts --dry-run",
+    "dashboard": "tsx src/dashboard.ts",
+    "applied": "tsx src/applied.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

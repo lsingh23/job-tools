@@ -1,0 +1,9 @@
+node_modules/
+output/
+data/
+.cache/
+*.log
+.DS_Store
+
+# Personal resume — keep out of the repo
+my-resume.md
