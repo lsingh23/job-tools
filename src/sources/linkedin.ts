@@ -22,15 +22,20 @@ function extractId(href: string | undefined, urn: string | undefined): string | 
   return fromUrl ?? null;
 }
 
-function buildUrl(term: string, geoId: string, remote: boolean, start: number): string {
+function buildUrl(
+  term: string,
+  loc: { geoId?: string; location?: string },
+  remote: boolean,
+  start: number,
+): string {
   const p = new URLSearchParams({
     keywords: term,
-    geoId,
     f_TPR: CONFIG.freshness.linkedin_f_TPR,
     start: String(start),
   });
+  if (loc.geoId) p.set("geoId", loc.geoId);
+  else if (loc.location) p.set("location", loc.location);
   if (remote) p.set("f_WT", CONFIG.linkedinParams.f_WT_remote);
-  // Server-side experience-level filter (f_E) so over-/under-target roles don't return.
   if (CONFIG.experience.linkedinLevels.length) p.set("f_E", CONFIG.experience.linkedinLevels.join(","));
   return `${CONFIG.endpoints.linkedin}?${p.toString()}`;
 }
@@ -59,9 +64,38 @@ export async function enrichLinkedInJobs(jobs: Job[]): Promise<number> {
       if (desc) job.description = desc;
       const salary = $(dsel.salary).first().text().trim();
       if (salary) job.salary = salary;
-      // First criterion is usually the seniority level (e.g. "Mid-Senior level").
-      const crit = $(dsel.criteria).first().text().trim();
-      if (crit) job.tags = [...job.tags, crit];
+      const applicants = $(dsel.applicants).first().text().trim();
+      if (applicants) job.applicants = applicants;
+
+      // Job criteria list: Seniority level / Employment type / Job function /
+      // Industries, in that order but not all always present — match by label.
+      $(dsel.criteriaItem).each((_, item) => {
+        const label = $(item).find(dsel.criteriaHeader).text().trim();
+        const value = $(item).find(dsel.criteria).text().trim();
+        if (!label || !value) return;
+        if (/seniority/i.test(label)) job.tags = [...job.tags, value];
+        else if (/employment type/i.test(label)) job.employmentType = value;
+        else if (/job function/i.test(label)) job.jobFunction = value;
+        else if (/industr/i.test(label)) job.industries = value;
+      });
+
+      // Apply type: LinkedIn distinguishes "onsite" (Easy Apply, stays on
+      // LinkedIn) from "offsite" (redirects to the company's own site/ATS)
+      // via the apply button's tracking-control-name.
+      const applyTrack = $(dsel.applyButton).first().attr("data-tracking-control-name") ?? "";
+      if (applyTrack.includes("apply-link-onsite")) job.applyType = "easy_apply";
+      else if (applyTrack.includes("apply-link-offsite")) job.applyType = "external";
+
+      // Recruiter/HR profile, when LinkedIn shows a "message the recruiter" block.
+      const recruiterEl = $(dsel.recruiterLink).first();
+      const recruiterHref = recruiterEl.attr("href");
+      const recruiterName = recruiterEl.attr("aria-label")?.replace(/^Message\s+/i, "").trim();
+      if (recruiterHref) {
+        const profileMatch = recruiterHref.match(/session_redirect=([^&]+)/);
+        job.hrProfileUrl = profileMatch ? decodeURIComponent(profileMatch[1]!) : recruiterHref;
+        if (recruiterName) job.hrName = recruiterName;
+      }
+
       if (desc) enriched++;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -83,11 +117,15 @@ export const linkedinSource: Source = {
     const maxPages = CONFIG.sources.linkedin.maxPages;
     const step = CONFIG.linkedinParams.pageStep;
 
+    // Priority boolean terms first so their higher-signal cards seed the dedupe
+    // set before the broad title queries (see CONFIG.linkedinPriorityTerms).
+    const terms = [...CONFIG.linkedinPriorityTerms, ...CONFIG.linkedinSearchTerms];
+
     for (const loc of CONFIG.locations.linkedin) {
-      for (const term of CONFIG.linkedinSearchTerms) {
+      for (const term of terms) {
         for (let page = 0; page < maxPages; page++) {
           const start = page * step;
-          const url = buildUrl(term, loc.geoId, loc.remote, start);
+          const url = buildUrl(term, loc, loc.remote, start);
           const label = `linkedin "${term}" @ ${loc.label} (start=${start})`;
           const html = await politeFetch(url, { cacheKey: `li:${term}:${loc.label}:${start}:E${CONFIG.experience.linkedinLevels.join("")}`, label });
 

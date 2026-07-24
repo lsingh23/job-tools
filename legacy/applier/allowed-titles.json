@@ -1,0 +1,19 @@
+{
+  "_comment": "The ONLY strings the tailor may use for the resume headline (blueprint honesty rule 5). Each must be a TRUTHFUL framing of Lakhveer's experience. When a JD's title isn't on this list (e.g. 'Engineering Manager', 'Staff Engineer'), the tailor picks the closest entry here and reports the mismatch. Edit this list to match how you actually want to be represented.",
+  "titles": [
+    "Frontend Engineer",
+    "Senior Frontend Engineer",
+    "Frontend Developer",
+    "Senior Frontend Developer",
+    "React Developer",
+    "React Engineer",
+    "UI Engineer",
+    "Software Engineer",
+    "Software Engineer (Frontend)",
+    "Software Development Engineer",
+    "Full Stack Engineer",
+    "Senior Full Stack Engineer",
+    "Full Stack Developer",
+    "Web Developer"
+  ]
+}

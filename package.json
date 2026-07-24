@@ -7,17 +7,27 @@
   "scripts": {
     "daily": "tsx src/index.ts",
     "daily:dry": "tsx src/index.ts --dry-run",
-    "dashboard": "tsx src/dashboard.ts",
+    "dashboard": "node --env-file=.env --import tsx src/dashboard.ts",
+    "collect": "node --env-file=.env --import tsx src/collect.ts",
     "applied": "tsx src/applied.ts",
-    "typecheck": "tsc --noEmit"
+    "applier": "node --env-file=.env applier/server.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:applier": "for f in applier/*.test.mjs; do echo \"— $f\"; node $f || exit 1; done"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "better-sqlite3": "^11.8.1",
-    "cheerio": "^1.0.0"
+    "cheerio": "^1.0.0",
+    "pg": "^8.22.0"
+  },
+  "overrides": {
+    "onnxruntime-node": "1.23.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.20.0",
+    "jsdom": "^29.1.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

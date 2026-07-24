@@ -1,5 +1,7 @@
 import { CONFIG } from "../config.js";
-import { loadKeywords } from "./resume.js";
+import { loadKeywords, loadResumeText } from "./resume.js";
+import { prefilterByTitle } from "./prefilter.js";
+import { scoreResumeVsJds } from "./tfidf.js";
 import { scoreAll } from "./scoring.js";
 import { writeCsv } from "./csv.js";
 import { runSource, type Source } from "./sources/base.js";
@@ -9,6 +11,8 @@ import { linkedinSource, enrichLinkedInJobs } from "./sources/linkedin.js";
 import { naukriSource } from "./sources/naukri.js";
 import { dedupe, dupKey } from "./dedupe.js";
 import { filterJobs } from "./filter.js";
+import { enrichWithSalary, formatBand } from "./salary.js";
+import { enrichWithPresence, formatPresence } from "./presence.js";
 import { splitNewVsSeen, record, stats } from "./tracker.js";
 import type { Job, SourceResult } from "./types.js";
 
@@ -56,23 +60,49 @@ async function main(): Promise<void> {
 
   const keywords = loadKeywords();
 
-  // LinkedIn listing cards are title-only, so their title-only score can't tell
-  // us which jobs are worth enriching — a perfect-fit JD behind a generic title
-  // ("Software Engineer") would score ~0% and be skipped. So enrich the whole
-  // LinkedIn set (bounded by maxEnrich for politeness) BEFORE scoring, then
-  // score everything once on the real JD text.
+  // Two-stage LinkedIn pipeline:
+  //   Stage 1 — keyword title pre-filter → drop obvious non-target roles cheaply.
+  //   Stage 2 — enrich survivors (fetch full JD) → keyword-score on real text.
+  let jobPool = allJobs;
+
+  if (CONFIG.sources.linkedin.enabled) {
+    const liJobs = jobPool.filter((j) => j.source === "linkedin");
+    if (liJobs.length > 0) {
+      const { kept, dropped } = prefilterByTitle(liJobs);
+      const keepIds = new Set(kept.map((j) => j.externalId));
+      jobPool = jobPool.filter((j) => j.source !== "linkedin" || keepIds.has(j.externalId));
+      console.log(`\n[Stage 1] Title pre-filter: ${liJobs.length} → ${kept.length} kept, ${dropped.length} dropped`);
+      if (dropped.length) {
+        const sample = dropped.slice(0, 6).map((d) => `  • ${d.job.title} (${d.reason})`).join("\n");
+        console.log(sample);
+        if (dropped.length > 6) console.log(`  … and ${dropped.length - 6} more`);
+      }
+    }
+  }
+
   if (CONFIG.sources.linkedin.enabled && CONFIG.linkedinEnrich.enabled && !dryRun) {
-    const liJobs = allJobs
+    const liJobs = jobPool
       .filter((j) => j.source === "linkedin")
       .slice(0, CONFIG.linkedinEnrich.maxEnrich);
     if (liJobs.length) {
-      console.log(`\nEnriching ${liJobs.length} LinkedIn jobs with full descriptions…`);
-      const n = await enrichLinkedInJobs(liJobs); // mutates jobs in place
+      console.log(`\n[Stage 2] Enriching ${liJobs.length} LinkedIn survivors with full JDs…`);
+      const n = await enrichLinkedInJobs(liJobs);
       console.log(`  enriched ${n}/${liJobs.length}`);
     }
   }
 
-  const scored = scoreAll(allJobs, keywords);
+  const scored = scoreAll(jobPool, keywords);
+
+  // TF-IDF similarity: resume vs each job's full description (post-enrichment).
+  // Uses the whole batch as the IDF corpus so generic posting language is
+  // down-weighted and distinctive tech terms are up-weighted automatically.
+  const resumeText = loadResumeText();
+  if (resumeText) {
+    const jdTexts = scored.map((j) => j.description || j.title);
+    const sims    = scoreResumeVsJds(resumeText, jdTexts);
+    scored.forEach((j, i) => { j.tfidfScore = sims[i]; });
+    console.log("\n[TF-IDF] similarity scores attached to all jobs.");
+  }
 
   // Collapse cross-posts (same role reposted across pages/locations/sources).
   const deduped = dedupe(scored);
@@ -91,6 +121,41 @@ async function main(): Promise<void> {
     console.log(`  drop reasons → ${summary.join("; ")}`);
   }
 
+  // Salary bands from AmbitionBox. Deliberately AFTER filtering: the shortlist
+  // is a fraction of the pool, and this costs one request per unique company.
+  let noAmbitionBox: string[] = [];
+  if (CONFIG.salary.enabled && !dryRun && kept.length) {
+    const uniq = new Set(kept.map((j) => j.company.trim()).filter(Boolean)).size;
+    console.log(`\n[Salary] Looking up AmbitionBox bands for ${uniq} unique companies…`);
+    const { matched, companies, unresolved } = await enrichWithSalary(kept);
+    console.log(`  attached bands to ${matched}/${kept.length} jobs across ${companies} companies`);
+    if (unresolved.length) {
+      console.log(`  no AmbitionBox page for: ${unresolved.slice(0, 8).join(", ")}${unresolved.length > 8 ? ` … +${unresolved.length - 8}` : ""}`);
+      console.log(`  → add slugs to CONFIG.salary.aliases if any of these matter.`);
+    }
+    noAmbitionBox = unresolved;
+  }
+
+  // Presence fallback — ONLY for the companies AmbitionBox had no page for.
+  // Where AmbitionBox does have a page, its founded-year / headcount / isClosed
+  // fields already answer "is this real?" better, and cost no extra request.
+  // These are mostly small or new startups, which says nothing about whether
+  // they're genuine — so we look at operating footprint instead of age.
+  if (CONFIG.presence.enabled && !dryRun && noAmbitionBox.length) {
+    console.log(`\n[Presence] No AmbitionBox page for ${noAmbitionBox.length} companies — checking online footprint…`);
+    const t = await enrichWithPresence(kept, noAmbitionBox);
+    console.log(`  probed ${t.probed}: ${t.operating} operating, ${t.thin} thin, ${t.unverified} unverified`);
+    // Print the ones that didn't clear `operating` — those are the only ones
+    // worth your eyes. One line per company, not per job.
+    const shown = new Set<string>();
+    for (const j of kept) {
+      if (!j.presence || j.presence.verdict === "operating") continue;
+      if (shown.has(j.company)) continue;
+      shown.add(j.company);
+      console.log(`  • ${j.company} → ${formatPresence(j.presence)}`);
+    }
+  }
+
   // Split into genuinely NEW vs already-seen using the local tracker. We split
   // on the SHORTLIST, but still record the full deduped set below so dropped
   // jobs aren't re-surfaced as "new" on the next run.
@@ -101,8 +166,9 @@ async function main(): Promise<void> {
   const preview = fresh.slice(0, 12);
   console.log(`\nTop ${Math.min(fresh.length, CONFIG.output.topN)} NEW by match %:`);
   for (const j of preview) {
+    const band = formatBand(j.salaryBand);
     console.log(
-      `  ${String(j.score).padStart(3)}%  ${j.title} @ ${j.company} [${j.source}]${j.seniority === "stretch" ? " (stretch)" : ""}`,
+      `  ${String(j.score).padStart(3)}%  ${j.title} @ ${j.company} [${j.source}]${j.seniority === "stretch" ? " (stretch)" : ""}${band ? `  — ${band}` : ""}`,
     );
   }
 

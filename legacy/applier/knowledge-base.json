@@ -1,0 +1,29 @@
+{
+  "contact": {
+    "first_name": "Lakhveer",
+    "last_name": "Singh",
+    "full_name": "Lakhveer Singh",
+    "email": "lakhveersingh10599@gmail.com",
+    "phone": "+918437341955",
+    "linkedin": "https://www.linkedin.com/in/lsingh23/",
+    "github": "https://github.com/lsingh23",
+    "portfolio": "https://lsingh23.github.io/my-portfolio/",
+    "address": "HSR Layout",
+    "pin code": "560102",
+    "location": "Bengaluru",
+    "city": "Bengaluru",
+    "country": "India"
+  },
+
+  
+  "qa": [
+    { "q": "What is your current CTC?", "a": "12 LPA" },
+    { "q": "Current CTC", "a": "12 LPA" },
+    { "q": "What is your expected CTC?", "a": "15 LPA" },
+    { "q": "Expected CTC", "a": "15 LPA" },
+    { "q": "What is your notice period?", "a": "Immediate / 0 days" },
+    { "q": "Notice period", "a": "Immediate / 0 days" },
+    { "q": "When can you join?", "a": "Immediately" },
+    { "q": "How soon can you join?", "a": "Immediately" }
+  ]
+}

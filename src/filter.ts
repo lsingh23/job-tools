@@ -40,7 +40,7 @@ function patternPresent(haystack: string, pattern: string): boolean {
 const SENIOR_TITLE = /(?<![a-z])(senior|sr\.?|staff|principal|lead|architect)(?![a-z])/i;
 
 /** Required MINIMUM years from a band like "3-5 Yrs" → 3, "10+ yrs" → 10. */
-function minRequiredYears(job: ScoredJob): number | null {
+export function minRequiredYears(job: ScoredJob): number | null {
   const band = job.experience;
   if (!band) return null;
   const t = band.toLowerCase();

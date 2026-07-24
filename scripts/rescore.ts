@@ -1,0 +1,64 @@
+/**
+ * Re-score every stored job against the CURRENT scoring config, in place.
+ *
+ * Scores are computed at collection time and frozen in the row, so a scoring
+ * change (weights, title classes, backend penalty) only reaches jobs the
+ * collector happens to see again. This applies it to everything already stored,
+ * using each row's saved JD text — no network calls.
+ *
+ *   node --env-file=.env --import tsx scripts/rescore.ts          # preview only
+ *   node --env-file=.env --import tsx scripts/rescore.ts --apply  # write back
+ */
+import { getPool, closePool } from "../src/db.js";
+import { scoreJob } from "../src/scoring.js";
+import { loadKeywords } from "../src/resume.js";
+import { CONFIG } from "../config.js";
+import type { Job } from "../src/types.js";
+
+const apply = process.argv.includes("--apply");
+const keywords = loadKeywords();
+const p = getPool();
+
+const { rows } = await p.query(
+  `SELECT external_id, title, company, description, experience, tags, score
+     FROM jobs ORDER BY score DESC NULLS LAST`,
+);
+
+const changes: { id: string; title: string; old: number; neu: number; cls: string }[] = [];
+for (const r of rows) {
+  if (!r.description) continue; // never re-score a row we have no JD for
+  const job: Job = {
+    source: "linkedin", externalId: r.external_id, title: r.title, company: r.company ?? "",
+    location: "", url: "", description: r.description, postedAt: null, salary: null,
+    experience: r.experience, remote: false, tags: Array.isArray(r.tags) ? r.tags : [],
+  };
+  const s = scoreJob(job, keywords);
+  changes.push({ id: r.external_id, title: r.title, old: r.score ?? 0, neu: s.score, cls: s.titleClass ?? "?" });
+}
+
+changes.sort((a, b) => (b.neu - b.old) - (a.neu - a.old));
+const moved = changes.filter((c) => c.neu !== c.old);
+process.stderr.write(`${changes.length} rows with a JD, ${moved.length} would change\n\n`);
+for (const c of [...moved.slice(0, 8), ...moved.slice(-8)]) {
+  process.stderr.write(`  ${String(c.old).padStart(3)} → ${String(c.neu).padStart(3)}  ${c.cls.padEnd(9)} ${c.title.slice(0, 60)}\n`);
+}
+const belowFloor = changes.filter((c) => c.neu < CONFIG.filter.minScore).length;
+process.stderr.write(`\n${belowFloor} rows would fall below minScore ${CONFIG.filter.minScore} (they stay in the table, just rank last)\n`);
+
+if (!apply) {
+  process.stderr.write("\npreview only — re-run with --apply to write\n");
+} else {
+  const client = await p.connect();
+  try {
+    await client.query("BEGIN");
+    for (const c of moved) await client.query("UPDATE jobs SET score = $2 WHERE external_id = $1", [c.id, c.neu]);
+    await client.query("COMMIT");
+    process.stderr.write(`\nupdated ${moved.length} rows\n`);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+await closePool();

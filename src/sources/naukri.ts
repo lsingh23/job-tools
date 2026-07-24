@@ -94,7 +94,7 @@ export const naukriSource: Source = {
             throw err;
           }
 
-          let data: { jobDetails?: NaukriJob[]; message?: string };
+          let data: { jobDetails?: NaukriJob[]; noOfJobs?: number; message?: string };
           try {
             data = JSON.parse(body);
           } catch {
@@ -108,7 +108,12 @@ export const naukriSource: Source = {
             );
           }
           if (!Array.isArray(data.jobDetails)) {
-            throw new Error("Naukri JSON missing 'jobDetails' — endpoint shape changed (check config).");
+            // When a query is exhausted on a clean page boundary, Naukri returns a
+            // 200 with `noOfJobs:0` and OMITS `jobDetails` entirely (it used to send
+            // an empty array). That's end-of-results, not breakage. Only treat a
+            // missing array as a real shape change when jobs actually exist.
+            if (!data.noOfJobs) break;
+            throw new Error("Naukri JSON missing 'jobDetails' despite noOfJobs>0 — endpoint shape changed (check config).");
           }
           if (data.jobDetails.length === 0) break; // no more pages for this query
 

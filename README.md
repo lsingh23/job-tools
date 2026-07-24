@@ -40,16 +40,86 @@ npm run typecheck                       # tsc --noEmit
 
 ### Dashboard (local UI)
 
-A minimal, zero-dependency web UI to trigger runs and browse the ranked CSVs:
+A minimal, zero-dependency web UI to run searches and browse the ranked CSVs:
 
 ```bash
 npm run dashboard            # → http://localhost:5173  (PORT=xxxx to change)
 ```
 
-It serves one page (Tailwind via CDN) with **Run daily** / **Dry run** buttons,
-on-screen guidance on when to run (and what *not* to do), and a sortable/filterable
-table of the latest `./output/*.csv` — pick any past run from the dropdown. Runs are
-single-flight (it won't launch a second scrape while one is in progress).
+One page (Tailwind via CDN): pick a city, a freshness window and pages/keyword,
+then **Search LinkedIn** or **Search Naukri**. Both drive `src/search.ts` and the
+same pipeline (prefilter → enrich → score → TF-IDF → dedupe → experience filter →
+salary → presence), stream progress live, render the ranked results, and write a
+CSV to `./output/`. Past searches are browsable from the dropdown below. Searches
+are single-flight (it won't launch a second scrape while one is in progress).
+
+The two sources differ in what they answer natively, so a couple of controls are
+platform-specific:
+
+| Control | LinkedIn | Naukri |
+| --- | --- | --- |
+| City | `geoId` (or `location=` text) | `location=` |
+| Time window | server-side, exact (`f_TPR=r<sec>`) | server-side in **days** (`jobAge`), narrowed to the hour client-side off `createdDate` |
+| Experience | `f_E` levels | `experience=<years>` (server-side band bracket) |
+| Under X applicants | `f_SB2` | **n/a** — Naukri never discloses applicant counts |
+| Salary / JD | needs a per-job detail fetch | inline in the search response (no enrich step) |
+
+Because Naukri's `sort=f` is newest-first, an hours window stops paging a keyword
+at the first card past the cutoff instead of walking a full day of results.
+
+> The old **Daily Run** tab (`npm run daily` on a schedule, over all sources) is
+> gone from the UI. The CLI entry point (`src/index.ts`) still exists.
+
+### Today (multi-city hourly collector → Neon)
+
+The top of the dashboard shows **Today's jobs** — the day's LinkedIn results across
+**all** target cities (Bengaluru, Hyderabad, Pune, Mumbai, Delhi, Chennai, Remote-India),
+persisted in **Neon Postgres** (`DATABASE_URL` in `.env`) so it **survives a refresh**
+and **accumulates through the day**.
+
+- **Automatic:** while `npm run dashboard` is running, an in-process scheduler runs a
+  full multi-city collection **every hour between 10am–7pm** (local time, `CONFIG.collect.activeHours`).
+- **Manual:** the **Run all cities now** button (or `npm run collect`) triggers one immediately.
+- **Dedupe/accumulate:** results upsert by `external_id`. A repeat sighting refreshes
+  `last_seen_at` and **unions the cities** it appeared under — it never duplicates a row,
+  so each hourly run adds only the genuinely new postings to the same day's set.
+
+```bash
+npm run collect                                   # all cities, config defaults (2h window, 2 pages)
+npm run collect -- --hours 6 --pages 3 --trigger manual
+```
+
+Efficiency: cards are fetched per city first, then the **union is deduped and the expensive
+pipeline (enrich + salary + presence) runs once** — a job cross-listed in 3 cities is enriched
+once, not three times.
+
+**Neon schema** (auto-created on first `npm run dashboard` / `collect`):
+- `jobs` — one row per posting for the day, keyed by `external_id`; carries the full scored
+  record plus `cities text[]`, `first_seen_at`, `last_seen_at`, `run_date`.
+- `runs` — one row per collection (`trigger` = `auto`/`manual`) with fetched/final/new counts,
+  status and any error, so the dashboard's status strip and the scheduler are auditable.
+
+> `DATABASE_URL` must be present — that's why `npm run dashboard`/`collect` use `node --env-file=.env`.
+> If Neon is unreachable, the single-search + CSV browser still work; only the Today view and the
+> hourly collector are disabled (with a console warning).
+
+#### LinkedIn search hacks (in `CONFIG.linkedinParams`)
+
+Applied in `src/pipeline.ts` `buildUrl()` — one place to tune result quality/freshness:
+
+| Param | Value | Why |
+| --- | --- | --- |
+| `sortBy` | `DD` | Date-descending (freshest first). The guest endpoint defaults to *relevance*; for hourly collection we want the newest cards on top so each run surfaces genuinely new postings. |
+| `f_AL` | `true` | **Actively Hiring** — companies actually reviewing applicants; cuts stale/ghost posts. |
+| `f_JT` | `F,C` | Full-time + Contract only; drops internship/part-time/volunteer noise. |
+| `f_TPR` | `r<sec>` | Time window; the collector uses a 2h window per hourly run (overlap buffer; DB dedupe collapses it). |
+| `f_E` | `2,3,4` | Experience levels (Entry/Associate/Mid-Senior), from `CONFIG.experience`. |
+
+Boolean keyword terms also help: `CONFIG.linkedinPriorityTerms` runs
+`Frontend Engineer AND ("hiring" OR "requirement")` first (tighter, higher-signal set), seeding
+the dedupe set before the broad title queries. LinkedIn's `keywords` honours `AND` / `OR` / `NOT`
+/ quoted phrases / parentheses — add your own there. (Naukri's guest API does **not** parse this
+syntax, which is why priority terms are LinkedIn-only.)
 
 Output: `./output/YYYY-MM-DD-HHMM.csv`, columns:
 `score, title, company, location, seniority, salary_lpa, matched_keywords,
@@ -301,3 +371,5 @@ crashes the run (see `src/sources/base.ts`).
 ## Attribution
 Job data via **RemoteOK** (remoteok.com) and **Remotive** (remotive.com), per
 their API terms (attribution + link back to the listing).
+
+! node --env-file=.env applier/server.mjs

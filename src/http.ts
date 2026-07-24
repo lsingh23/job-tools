@@ -24,11 +24,11 @@ function cachePath(key: string): string {
   return join(CONFIG.data.cacheDir, `${hash}.cache`);
 }
 
-function readCache(key: string): string | null {
+function readCache(key: string, ttlMinutes: number): string | null {
   const p = cachePath(key);
   if (!existsSync(p)) return null;
   const ageMin = (Date.now() - statSync(p).mtimeMs) / 60000;
-  if (ageMin > CONFIG.http.cacheTtlMinutes) return null;
+  if (ageMin > ttlMinutes) return null;
   return readFileSync(p, "utf8");
 }
 
@@ -43,6 +43,14 @@ export interface FetchOpts {
   noDelay?: boolean;
   /** Cache key; if set, responses are cached on disk for the TTL. */
   cacheKey?: string;
+  /** Override the default cache TTL — for data that ages slowly (e.g. salary aggregates). */
+  ttlMinutes?: number;
+  /**
+   * Override the retry budget. Lower it for a flaky OPTIONAL source that has a
+   * fallback (crt.sh 502s for minutes at a time; burning the full backoff ladder
+   * on it just delays the alternative that would have worked).
+   */
+  maxRetries?: number;
   label?: string;
 }
 
@@ -66,9 +74,9 @@ export class HttpError extends Error {
  */
 export async function politeFetch(url: string, opts: FetchOpts = {}): Promise<string> {
   if (opts.cacheKey) {
-    const cached = readCache(opts.cacheKey);
+    const cached = readCache(opts.cacheKey, opts.ttlMinutes ?? CONFIG.http.cacheTtlMinutes);
     if (cached !== null) {
-      console.log(`  [cache] ${opts.label ?? url}`);
+      process.stderr.write(`  [cache] ${opts.label ?? url}\n`);
       return cached;
     }
   }
@@ -77,11 +85,12 @@ export async function politeFetch(url: string, opts: FetchOpts = {}): Promise<st
     await sleep(rand(CONFIG.http.minDelayMs, CONFIG.http.maxDelayMs));
   }
 
+  const maxRetries = opts.maxRetries ?? CONFIG.http.maxRetries;
   let lastErr = "";
-  for (let attempt = 0; attempt <= CONFIG.http.maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
       const backoff = CONFIG.http.backoffBaseMs * 2 ** (attempt - 1) + rand(0, 1000);
-      console.warn(`  [retry ${attempt}/${CONFIG.http.maxRetries}] ${opts.label ?? url} after ${backoff}ms — ${lastErr}`);
+      process.stderr.write(`  [retry ${attempt}/${maxRetries}] ${opts.label ?? url} after ${backoff}ms — ${lastErr}\n`);
       await sleep(backoff);
     }
 
@@ -118,5 +127,5 @@ export async function politeFetch(url: string, opts: FetchOpts = {}): Promise<st
       clearTimeout(timer);
     }
   }
-  throw new Error(`Failed after ${CONFIG.http.maxRetries} retries: ${lastErr}`);
+  throw new Error(`Failed after ${maxRetries} retries: ${lastErr}`);
 }

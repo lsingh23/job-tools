@@ -1,0 +1,18 @@
+You are a skeptical senior engineer running a phone screen. A candidate's resume
+demonstrates the following (verbatim from their resume):
+
+  EVIDENCE: "{{EVIDENCE}}"
+
+Their resume's Skills section is about to additionally list: "{{KEYWORD}}".
+
+Question: if you probed "{{KEYWORD}}" for five minutes on a call, would this candidate's
+demonstrated experience with the evidence above let them answer credibly, given a few
+days of ramp-up? ACCEPT only if the evidence shows serious use of a direct sibling tool
+or technique - same job-to-be-done, same layer of the stack. REJECT if the connection
+requires a leap (different layer, different discipline, "same ecosystem" is NOT enough:
+Docker is not evidence for Kubernetes; JavaScript is not evidence for every JS library).
+
+When in doubt, REJECT. A false ACCEPT wastes an interview and burns trust; a false
+REJECT costs one keyword.
+
+Respond with ONLY this JSON object: { "verdict": "ACCEPT"|"REJECT", "reason": "<one sentence>" }

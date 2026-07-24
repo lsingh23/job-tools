@@ -4,6 +4,12 @@ data/
 .cache/
 *.log
 .DS_Store
+.env
+.env.*
 
 # Personal resume — keep out of the repo
 my-resume.md
+*.docx
+applier/master-resume.docx
+applier/tailored/
+applier/applications.json

@@ -1,0 +1,104 @@
+LinkedIn Guest API — Keyword Alignment Test
+Search params: geoId=90009633 (India) | f_TPR=r3600 (last 1hr) | sortBy=DD
+Fetched: 2026-07-07
+================================================================================
+
+KEYWORD: "frontend engineer"
+Results: 6 / 10
+--------------------------------------------------------------------------------
+  1. [26 min ago] Senior Digital Engineer (Frontend)                    @ Mott MacDonald         ✅ id:4429218523
+  2. [44 min ago] Principal SDE (React/Javascript/Typescript)           @ Zscaler                ✅ id:4437805349
+  3. [36 min ago] JR-190764 Angular Developer Middle                    @ Customertimes          ⚠️ id:4436598816
+  4. [ 1 hr ago ] Staff Software Engineer - Frontend                    @ Weekday (YC W21)       ✅ id:4431245922
+  5. [21 min ago] Senior Fullstack Developer                            @ Instead                ⚠️ id:4434555327
+  6. [30 min ago] Application Developer-Cloud FullStack                 @ IBM                    ❌ id:4414896206
+
+Signal: 3/6 clean frontend, 2/6 fullstack noise, 1/6 unrelated cloud
+
+
+KEYWORD: "react reactjs developer"
+Results: 10 / 10
+--------------------------------------------------------------------------------
+  1. [26 min ago] Senior Digital Engineer (Frontend)                    @ Mott MacDonald         ✅ id:4429218523 (dup)
+  2. [44 min ago] Principal SDE (React/Javascript/Typescript)           @ Zscaler                ✅ id:4437805349 (dup)
+  3. [41 min ago] Java Full Stack Developer with React                   @ TCS                    ❌ id:4436812196
+  4. [30 min ago] Application Developer-Cloud FullStack                 @ IBM                    ❌ id:4414896206 (dup)
+  5. [36 min ago] JR-190764 Angular Developer Middle                    @ Customertimes          ⚠️ id:4436598816 (dup)
+  6. [21 min ago] Senior Fullstack Developer                            @ Instead                ⚠️ id:4434555327 (dup)
+  7. [28 min ago] Senior Software Engineer - IAM Team                   @ DAT Freight & Analytics ⚠️ id:4436802681
+  8. [ 7 min ago] Staff Software Engineer                               @ symplr                 ⚠️ id:4436817188
+  9. [14 min ago] TTT - SAP UI5 - FIORI Full Stack Developer - Asst Mgr @ EY                    ❌ id:4426824904
+ 10. [47 min ago] .Net/Dot Net Full Stack Developer                     @ Infosys                ❌ id:4418234656
+
+Signal: 2/10 clean frontend, 4/10 fullstack/ambiguous, 4/10 pure noise (Java, SAP, .Net)
+
+
+KEYWORD: "nextjs developer"
+Results: 0 / 10
+--------------------------------------------------------------------------------
+  (no results in last 1 hour for this geo)
+
+
+KEYWORD: "javascript developer"
+Results: 10 / 10
+--------------------------------------------------------------------------------
+  1. [ 1 hr ago ] React GenAI Developer                                 @ Infosys                ⚠️ id:4436593794
+  2. [ 1 hr ago ] Web Developer                                         @ Gallagher              ⚠️ id:4342217857
+  3. [ 1 hr ago ] Angular GenAI Developer                               @ Infosys                ❌ id:4436811045
+  4. [ 1 hr ago ] Full-stack Agentic AI Developer - Associate           @ PwC Acceleration Center ⚠️ id:4426405708
+  5. [ 1 hr ago ] Full Stack Engineer                                   @ BT Group               ⚠️ id:4436597693
+  6. [ 1 hr ago ] Senior Frontend Developer                             @ BayOne Solutions        ✅ id:4436800383
+  7. [36 min ago] JR-190764 Angular Developer Middle                    @ Customertimes          ⚠️ id:4436598816 (dup)
+  8. [ 1 hr ago ] Java Angular Developer                                @ Infosys                ❌ id:4436589842
+  9. [30 min ago] Application Developer-Cloud FullStack                 @ IBM                    ❌ id:4414896206 (dup)
+ 10. [41 min ago] Java Full Stack Developer with React                   @ TCS                    ❌ id:4436812196 (dup)
+
+Signal: 1/10 clean frontend, 5/10 fullstack/ambiguous, 4/10 pure noise (Java, Angular, GenAI)
+
+
+KEYWORD: "typescript developer"
+Results: 0 / 10
+--------------------------------------------------------------------------------
+  (no results in last 1 hour for this geo)
+
+
+================================================================================
+DEDUPLICATION SUMMARY
+================================================================================
+
+Unique job IDs across all searches: 14
+  id:4429218523  Senior Digital Engineer (Frontend)               @ Mott MacDonald         ✅
+  id:4437805349  Principal SDE (React/JS/TS)                      @ Zscaler                ✅
+  id:4431245922  Staff Software Engineer - Frontend               @ Weekday (YC W21)       ✅
+  id:4436800383  Senior Frontend Developer                        @ BayOne Solutions        ✅
+  id:4434555327  Senior Fullstack Developer                        @ Instead                ⚠️
+  id:4436802681  Senior Software Engineer - IAM Team              @ DAT Freight & Analytics ⚠️
+  id:4436817188  Staff Software Engineer                          @ symplr                 ⚠️
+  id:4436593794  React GenAI Developer                            @ Infosys                ⚠️
+  id:4342217857  Web Developer                                    @ Gallagher              ⚠️
+  id:4426405708  Full-stack Agentic AI Developer - Associate      @ PwC Acceleration Center ⚠️
+  id:4436597693  Full Stack Engineer                              @ BT Group               ⚠️
+  id:4436598816  Angular Developer Middle                         @ Customertimes          ⚠️
+  id:4414896206  Application Developer-Cloud FullStack            @ IBM                    ❌
+  id:4436812196  Java Full Stack Developer with React             @ TCS                    ❌
+  id:4426824904  SAP UI5 FIORI Full Stack Developer               @ EY                     ❌
+  id:4418234656  .Net Full Stack Developer                        @ Infosys                ❌
+
+Genuinely frontend-aligned (✅): 4 / 16  (25%)
+Ambiguous / partial (⚠️):       8 / 16  (50%)
+Pure noise (❌):                  4 / 16  (25%)
+
+================================================================================
+CONCLUSION
+================================================================================
+- "frontend engineer"         → Best precision (50% clean), but lowest recall (6 results)
+- "react reactjs developer"   → More results but heavily diluted (20% clean)
+- "javascript developer"      → Noisiest (10% clean) — Java/Angular/GenAI bleed-in
+- "nextjs developer"          → Zero results in 1hr window (too niche)
+- "typescript developer"      → Zero results in 1hr window (too niche)
+
+Recommended multi-keyword strategy:
+  1. Run "frontend engineer" + "react developer" + "frontend developer" (not covered above)
+  2. Deduplicate by job ID (already done in codebase)
+  3. Title-filter score penalty for "Java", "Angular", ".Net", "SAP", "FullStack" in title
+================================================================================

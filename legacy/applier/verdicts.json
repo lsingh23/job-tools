@@ -1,0 +1,40 @@
+{
+  "master": "055c10611c33",
+  "verdicts": {
+    "event streaming": {
+      "verdict": "REJECT",
+      "by": "user-veto",
+      "at": "2026-07-14",
+      "evidence": "real-time run streaming and agent run-state over SSE with optimistic UI",
+      "reason": "user vetoed in badge"
+    },
+    "rbac": {
+      "verdict": "ACCEPT",
+      "by": "ai",
+      "at": "2026-07-14",
+      "evidence": "modeling approval thresholds, role hierarchies, and dual-control state transitions",
+      "reason": "The candidate built an authorization module with role hierarchies and dual-control state transitions, which directly implements RBAC concepts."
+    },
+    "modular architecture": {
+      "verdict": "ACCEPT",
+      "by": "ai",
+      "at": "2026-07-14",
+      "evidence": "Refactored the wire-transfer platform's Redux layer splitting overlapping reducers, normalizing duplicated and nested state, and adding memoized selectors",
+      "reason": "The candidate's refactoring of Redux state with normalized, memoized selectors demonstrates hands-on modular architecture at the same data layer."
+    },
+    "cloud-native": {
+      "verdict": "REJECT",
+      "by": "ai",
+      "at": "2026-07-14",
+      "evidence": "one-click deploys to Cloudflare Workers",
+      "reason": "Using Drizzle, Hono, and Cloudflare Workers shows experience with specific tools, not the broad, abstract 'cloud-native' concept which encompasses many other practices like containerization, orchestration, and microservices."
+    },
+    "secure data flows": {
+      "verdict": "REJECT",
+      "by": "ai",
+      "at": "2026-07-14",
+      "evidence": "human-in-the-loop approval gating high-stakes actions",
+      "reason": "Building a frontend for an AI platform does not demonstrate experience with secure data flows, which is a distinct security engineering discipline."
+    }
+  }
+}
