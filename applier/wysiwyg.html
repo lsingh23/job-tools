@@ -1,0 +1,175 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Résumé editor</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #55585c; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111; }
+
+  /* ── toolbar ─────────────────────────────────────────────────────────────── */
+  .bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         padding: 8px 12px; background: #23262a; color: #e8e8e8; box-shadow: 0 1px 6px rgba(0,0,0,.4); }
+  .bar label { opacity: .65; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .bar select, .bar input[type=text] { background: #14161a; color: #eee; border: 1px solid #3a3f45; border-radius: 5px;
+         padding: 5px 8px; font: inherit; }
+  .bar input[type=text] { width: 300px; }
+  .bar button { background: #2f6fed; color: #fff; border: 0; border-radius: 5px; padding: 6px 12px; font: inherit;
+         font-weight: 600; cursor: pointer; }
+  .bar button.ghost { background: #363b42; font-weight: 500; }
+  .bar button:disabled { opacity: .5; cursor: default; }
+  .spacer { flex: 1; }
+  .group { display: flex; gap: 8px; align-items: center; }
+  .status { font-size: 12px; opacity: .85; min-height: 16px; }
+  .status.err { color: #ff8a80; }
+  .status.ok { color: #9ae6a0; }
+  .pages { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #2d3238; }
+  .pages.warn { background: #7a3b12; color: #ffd7b0; }
+
+  /* ── the page: real .docx geometry, so what you type is what prints ──────── */
+  .stage { padding: 22px 0 60px; display: flex; justify-content: center; }
+  .page { background: #fff; box-shadow: 0 3px 18px rgba(0,0,0,.45); }
+  .para { margin: 0; }
+  .para.empty { min-height: .8em; }
+  .t { white-space: pre-wrap; }
+  .t.ed:hover { background: rgba(47,111,237,.09); }
+  .t.ed:focus { outline: 2px solid #2f6fed; outline-offset: 1px; border-radius: 2px; background: rgba(47,111,237,.07); }
+  .t.dirty { background: rgba(255,214,0,.28); }
+  .t.dirty:focus { background: rgba(255,214,0,.35); }
+  .tabrow .col { display: inline-flex; }
+  .tabrow .col.right { white-space: nowrap; }
+  .bullet { user-select: none; }
+
+  /* ── real-PDF pane ───────────────────────────────────────────────────────── */
+  #pdf { display: none; width: 100%; height: calc(100vh - 52px); border: 0; background: #55585c; }
+  body.showpdf .stage { display: none; }
+  body.showpdf #pdf { display: block; }
+  .hint { text-align: center; color: #c8ccd0; font-size: 12px; padding-bottom: 24px; }
+</style>
+
+<div class="bar">
+  <label for="src">Source</label>
+  <select id="src"></select>
+  <button class="ghost" id="reload">Reload</button>
+  <span class="spacer"></span>
+  <span class="group">
+    <label for="name">Save as</label>
+    <input type="text" id="name" placeholder="Lakhveer Singh - Company - 2026-08-12">
+    <button id="save">Save PDF</button>
+    <button class="ghost" id="toggle">Real PDF</button>
+  </span>
+  <span class="pages" id="pages"></span>
+  <span class="status" id="status"></span>
+</div>
+
+<div class="stage"><div class="page" id="page"></div></div>
+<div class="hint" id="hint">Click any line to edit it. Formatting is locked to the original — you edit text only.
+  Enter is disabled (it would create a paragraph the .docx has no style for).</div>
+<iframe id="pdf" title="rendered PDF"></iframe>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (p, body) => fetch(p, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : undefined)
+  .then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+
+let original = new Map();   // id → text as loaded, for the dirty highlight
+let pdfUrl = null;
+
+const setStatus = (msg, kind = "") => { const s = $("status"); s.textContent = msg; s.className = "status " + kind; };
+
+function collect() {
+  const edits = {};
+  for (const el of document.querySelectorAll(".t")) edits[el.dataset.id] = el.textContent;
+  return edits;
+}
+
+function markDirty(el) {
+  el.classList.toggle("dirty", el.textContent !== original.get(el.dataset.id));
+}
+
+async function load(src) {
+  setStatus("loading…");
+  const d = await api("/wysiwyg/doc?src=" + encodeURIComponent(src || ""));
+  // Source picker (first load only — reloading must not clobber the user's choice).
+  if (!$("src").options.length) {
+    for (const s of d.sources) $("src").add(new Option(s.label, s.key));
+  }
+  $("src").value = d.src;
+
+  const page = $("page");
+  page.style.width = d.page.width + "px";
+  page.style.minHeight = d.page.height + "px";
+  page.style.padding = `${d.page.top}px ${d.page.right}px ${Math.max(d.page.bottom, 24)}px ${d.page.left}px`;
+  page.style.font = `${d.defaults.sizePx}px/1.15 '${d.defaults.font}', Georgia, serif`;
+  page.style.color = d.defaults.color;
+  page.innerHTML = d.html;
+
+  original = new Map();
+  for (const el of document.querySelectorAll(".t")) original.set(el.dataset.id, el.textContent);
+
+  if (!$("name").value) $("name").value = d.suggested_name;
+  $("pages").textContent = "";
+  document.body.classList.remove("showpdf");
+  setStatus(`${original.size} editable pieces`, "ok");
+}
+
+// ── edit guards: text only, no structure ──────────────────────────────────────
+// Enter would split the span into nodes with no .docx paragraph behind them, and a rich paste
+// would smuggle foreign markup into a run. Both are dropped at the door.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.classList?.contains("ed")) e.preventDefault();
+});
+document.addEventListener("paste", (e) => {
+  if (!e.target.classList?.contains("ed")) return;
+  e.preventDefault();
+  const text = (e.clipboardData || window.clipboardData).getData("text/plain").replace(/\s*\n\s*/g, " ");
+  document.execCommand("insertText", false, text);
+});
+document.addEventListener("input", (e) => { if (e.target.classList?.contains("ed")) markDirty(e.target); });
+
+// ── actions ───────────────────────────────────────────────────────────────────
+$("src").onchange = () => load($("src").value);
+$("reload").onclick = () => load($("src").value);
+
+$("toggle").onclick = async () => {
+  if (document.body.classList.contains("showpdf")) { document.body.classList.remove("showpdf"); return; }
+  setStatus("rendering PDF…");
+  try {
+    const r = await api("/wysiwyg/preview", { src: $("src").value, edits: collect() });
+    showPdf(r);
+    document.body.classList.add("showpdf");
+    setStatus("rendered by LibreOffice — this is exactly what saves", "ok");
+  } catch (err) { setStatus(err.message, "err"); }
+};
+
+$("save").onclick = async () => {
+  const name = $("name").value.trim();
+  if (!name) { setStatus("give it a name first", "err"); $("name").focus(); return; }
+  $("save").disabled = true;
+  setStatus("saving…");
+  try {
+    const body = { src: $("src").value, edits: collect(), name };
+    let r = await api("/wysiwyg/save", body).catch(async (err) => {
+      if (!/exists/i.test(err.message)) throw err;
+      if (!confirm(err.message + "\n\nOverwrite it?")) return null;
+      return api("/wysiwyg/save", { ...body, overwrite: true });
+    });
+    if (!r) { setStatus("cancelled"); return; }
+    showPdf(r);
+    setStatus(`saved → ${r.pdf_path}`, "ok");
+    // Saved file is the new source, so further edits build on it rather than the master.
+    if (!$("src").querySelector(`option[value="${CSS.escape(r.src_key)}"]`)) $("src").add(new Option(r.name + " (tailored)", r.src_key));
+  } catch (err) { setStatus(err.message, "err"); }
+  finally { $("save").disabled = false; }
+};
+
+function showPdf(r) {
+  $("pages").textContent = r.pages + (r.pages === 1 ? " page" : " pages");
+  $("pages").className = "pages" + (r.pages > 1 ? " warn" : "");
+  const bytes = Uint8Array.from(atob(r.pdf_base64), (c) => c.charCodeAt(0));
+  if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+  pdfUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  $("pdf").src = pdfUrl;
+}
+
+load(new URL(location.href).searchParams.get("src") || "").catch((e) => setStatus(e.message, "err"));
+</script>

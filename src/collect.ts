@@ -22,7 +22,8 @@
 import { CONFIG } from "../config.js";
 import { fetchLinkedInCards, runPipeline, type LinkedInLocation, type PipelineMemory } from "./pipeline.js";
 import { startRun, finishRun, upsertJobs, today, initSchema, getSeenCards, recordSeenCards } from "./db.js";
-import type { Job } from "./types.js";
+import { surfaceHotJob } from "./surface.js";
+import type { Job, ScoredJob } from "./types.js";
 
 export interface CollectOpts {
   hours?: number;
@@ -86,7 +87,25 @@ export async function runCollection(opts: CollectOpts = {}): Promise<CollectResu
     log(`[collect] ${cards.length} unique cards across ${locations.length} cities`);
 
     // 2. One pipeline pass over the whole union.
-    const { jobs, stats } = await runPipeline(cards, { log, memory });
+    //
+    //    `onScored` is the mid-run escape hatch: a job clearing
+    //    CONFIG.notify.hotScore is written to the DB and banner-alerted the
+    //    moment its JD is read, ~15 min before this run finishes. The dashboard
+    //    polls every 60s, so it simply appears. Failures here are swallowed —
+    //    a hot-path hiccup must not kill a run that is otherwise fine.
+    const onScored = async (job: ScoredJob) => {
+      try {
+        await surfaceHotJob(job, {
+          runDate,
+          cities: citiesByExternalId.get(job.externalId),
+          log: (...a) => log("[collect]", ...a),
+        });
+      } catch (e) {
+        log(`[collect] hot-path failed for ${job.externalId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    };
+
+    const { jobs, stats } = await runPipeline(cards, { log, memory, onScored });
     log(
       `[collect] pipeline → ${jobs.length} shortlisted ` +
       `(${stats.skippedSeen} skipped as already-rejected, ${stats.reusedJd} JDs reused, ${stats.enriched} freshly enriched)`,

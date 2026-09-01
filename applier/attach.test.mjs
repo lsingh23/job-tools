@@ -38,7 +38,9 @@ function boot(html, { hidden = [] } = {}) {
   const GM = new Map();
   window.GM_getValue = (k, d) => (GM.has(k) ? GM.get(k) : d);
   window.GM_setValue = (k, v) => GM.set(k, v);
-  window.GM_xmlhttpRequest = () => {};
+  // No applier server in tests: fail the request rather than hanging the caller
+  // (a stub that never calls back leaves every await on it pending forever).
+  window.GM_xmlhttpRequest = (o) => setTimeout(() => o.onerror && o.onerror({ error: "no server" }), 0);
   // jsdom has no DataTransfer, and its `files` setter demands a real FileList that can't be
   // constructed outside a browser. Both exist for real in Chrome/Firefox — `el.files =
   // dt.files` is the standard attach trick — so stub them to observe what we assign.
@@ -84,20 +86,20 @@ console.log("\nATTACH");
 {
   const { window, GM, t } = boot(FORM);
   GM.set("jobfill_resume", RESUME);
-  const msg = t.attachResume();
+  const msg = await t.attachResume();
   check("reports the attach", /attached Lakhveer Singh - Wissen/.test(msg), true);
   check("file actually landed on the hidden input", window.document.getElementById("resume_file").files[0].name, RESUME.name);
   check("cover-letter input left alone", window.document.getElementById("cl_file").files.length, 0);
-  check("second call is idempotent", t.attachResume(), "📎 already attached");
+  check("second call is idempotent", await t.attachResume(), "📎 already attached");
 }
 {
   const { t } = boot(FORM);
-  check("no cached résumé → honest message, no crash", t.attachResume(), "no résumé cached");
+  check("no cached résumé → honest message, no crash", await t.attachResume(), "no résumé cached (and no default on server)");
 }
 {
   const { GM, t } = boot(`<!doctype html><html><body><form><label for="e">Email</label><input id="e"></form></body></html>`);
   GM.set("jobfill_resume", RESUME);
-  check("page with no upload → honest message", t.attachResume(), "no upload on this page");
+  check("page with no upload → honest message", await t.attachResume(), "no upload on this page");
 }
 
 // ── the single-upload fallback ───────────────────────────────────────────────
@@ -109,7 +111,7 @@ console.log("\nSINGLE-UPLOAD FALLBACK (no 'resume' wording anywhere)");
   </form></body></html>`);
   GM.set("jobfill_resume", RESUME);
   check("lone unlabelled upload is assumed to be the résumé", t.resumeSlot()?.id, "only");
-  check("  → and gets attached", /attached/.test(t.attachResume()), true);
+  check("  → and gets attached", /attached/.test(await t.attachResume()), true);
   check("  → file landed", window.document.getElementById("only").files.length, 1);
 }
 {
@@ -151,7 +153,7 @@ console.log("\nPER-SITE RECIPE (learning from your manual attach)");
   check("warm: recipe picks YOUR control, no scoring", t.resumeSlot()?.name, "doc_b");
 
   GM.set("jobfill_resume", RESUME);
-  check("  → and attaches to it", /attached/.test(t.attachResume()), true);
+  check("  → and attaches to it", /attached/.test(await t.attachResume()), true);
   check("  → on doc_b, not doc_a", window.document.querySelector('[name="doc_b"]').files.length, 1);
   check("  → doc_a untouched", window.document.querySelector('[name="doc_a"]').files.length, 0);
 }
@@ -161,7 +163,7 @@ console.log("\nPROVENANCE (our own attach must not teach the recipe)");
 {
   const { GM, t } = boot(FORM);
   GM.set("jobfill_resume", RESUME);
-  t.attachResume();                                    // autofill attaches — a GUESS
+  await t.attachResume();                              // autofill attaches — a GUESS
   check("our own attach did NOT write a recipe", t.recipeGet(), null);
 }
 {

@@ -70,19 +70,22 @@ at the first card past the cutoff instead of walking a full day of results.
 > The old **Daily Run** tab (`npm run daily` on a schedule, over all sources) is
 > gone from the UI. The CLI entry point (`src/index.ts`) still exists.
 
-### Today (multi-city hourly collector → Neon)
+### Today (multi-city half-hourly collector → Neon)
 
 The top of the dashboard shows **Today's jobs** — the day's LinkedIn results across
-**all** target cities (Bengaluru, Hyderabad, Pune, Mumbai, Delhi, Chennai, Remote-India),
-persisted in **Neon Postgres** (`DATABASE_URL` in `.env`) so it **survives a refresh**
-and **accumulates through the day**.
+**all** target cities (Bengaluru, Hyderabad, Pune, Mumbai, Delhi, Gurugram, Noida,
+Chennai, Remote-India), persisted in **Neon Postgres** (`DATABASE_URL` in `.env`) so it
+**survives a refresh** and **accumulates through the day**.
 
 - **Automatic:** while `npm run dashboard` is running, an in-process scheduler runs a
-  full multi-city collection **every hour between 10am–7pm** (local time, `CONFIG.collect.activeHours`).
+  full multi-city collection **every 30 minutes from 9:30am to 9:00pm** local time —
+  9:30, 10:00, 10:30 … 21:00, i.e. 24 runs/day (`CONFIG.collect.activeWindow` +
+  `intervalMinutes`). Slots are pinned to the wall-clock grid, so a slow run or a
+  laptop sleep can't drift the schedule.
 - **Manual:** the **Run all cities now** button (or `npm run collect`) triggers one immediately.
 - **Dedupe/accumulate:** results upsert by `external_id`. A repeat sighting refreshes
   `last_seen_at` and **unions the cities** it appeared under — it never duplicates a row,
-  so each hourly run adds only the genuinely new postings to the same day's set.
+  so each run adds only the genuinely new postings to the same day's set.
 
 ```bash
 npm run collect                                   # all cities, config defaults (2h window, 2 pages)
@@ -101,7 +104,7 @@ once, not three times.
 
 > `DATABASE_URL` must be present — that's why `npm run dashboard`/`collect` use `node --env-file=.env`.
 > If Neon is unreachable, the single-search + CSV browser still work; only the Today view and the
-> hourly collector are disabled (with a console warning).
+> scheduled collector are disabled (with a console warning).
 
 #### LinkedIn search hacks (in `CONFIG.linkedinParams`)
 
@@ -109,10 +112,10 @@ Applied in `src/pipeline.ts` `buildUrl()` — one place to tune result quality/f
 
 | Param | Value | Why |
 | --- | --- | --- |
-| `sortBy` | `DD` | Date-descending (freshest first). The guest endpoint defaults to *relevance*; for hourly collection we want the newest cards on top so each run surfaces genuinely new postings. |
+| `sortBy` | `DD` | Date-descending (freshest first). The guest endpoint defaults to *relevance*; for scheduled collection we want the newest cards on top so each run surfaces genuinely new postings. |
 | `f_AL` | `true` | **Actively Hiring** — companies actually reviewing applicants; cuts stale/ghost posts. |
 | `f_JT` | `F,C` | Full-time + Contract only; drops internship/part-time/volunteer noise. |
-| `f_TPR` | `r<sec>` | Time window; the collector uses a 2h window per hourly run (overlap buffer; DB dedupe collapses it). |
+| `f_TPR` | `r<sec>` | Time window; the collector uses a 2h window per run against a 30-min cadence (deliberate overlap buffer; DB dedupe collapses it). |
 | `f_E` | `2,3,4` | Experience levels (Entry/Associate/Mid-Senior), from `CONFIG.experience`. |
 
 Boolean keyword terms also help: `CONFIG.linkedinPriorityTerms` runs
@@ -372,4 +375,4 @@ crashes the run (see `src/sources/base.ts`).
 Job data via **RemoteOK** (remoteok.com) and **Remotive** (remotive.com), per
 their API terms (attribution + link back to the listing).
 
-! node --env-file=.env applier/server.mjs
+

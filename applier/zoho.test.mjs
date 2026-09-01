@@ -57,7 +57,9 @@ window.CSS = { escape: (s) => String(s).replace(/[^\w-]/g, (c) => "\\" + c) };
 const GM = new Map();
 window.GM_getValue = (k, d) => (GM.has(k) ? GM.get(k) : d);
 window.GM_setValue = (k, v) => GM.set(k, v);
-window.GM_xmlhttpRequest = () => {};
+// No applier server in tests: fail the request rather than hanging the caller
+// (a stub that never calls back leaves every await on it pending forever).
+window.GM_xmlhttpRequest = (o) => setTimeout(() => o.onerror && o.onerror({ error: "no server" }), 0);
 window.DataTransfer = class { constructor() { const f = []; this.items = { add: (x) => f.push(x) }; this.files = f; } };
 Object.defineProperty(window.HTMLInputElement.prototype, "files", {
   configurable: true, get() { return this.__files || []; }, set(v) { this.__files = v; },
@@ -119,7 +121,7 @@ console.log(`       required   score=${t.resumeScore(real)}  ctx=${JSON.stringif
 check("picks the REQUIRED résumé field, not the autofill widget", t.resumeSlot()?.name, "rec-form_80238000000017197_file");
 
 GM.set("jobfill_resume", { name: "Lakhveer Singh - Wissen - 2026-07-16.pdf", type: "application/pdf", b64: btoa("%PDF fake") });
-check("attaches", /attached/.test(t.attachResume()), true);
+check("attaches", /attached/.test(await t.attachResume()), true);
 check("  → onto the required field", real.files.length, 1);
 check("  → easyresume widget untouched", easy.files.length, 0);
 

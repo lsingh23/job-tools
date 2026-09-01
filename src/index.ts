@@ -23,6 +23,10 @@ function enabledSources(): Source[] {
   if (CONFIG.sources.remoteok.enabled) list.push(remoteokSource);
   if (CONFIG.sources.linkedin.enabled) list.push(linkedinSource);
   if (CONFIG.sources.naukri.enabled) list.push(naukriSource); // local-only (residential India IP); nkparam unblock
+  // NOTE: the ATS board sources are deliberately NOT here. They run on their own
+  // 15-minute scheduler inside the dashboard (src/ats-collect.ts) because their
+  // cadence, cost model and staleness rules are all different from the scraped
+  // sources — see CONFIG.ats.poll. `npm run ats` runs them standalone.
   return list;
 }
 

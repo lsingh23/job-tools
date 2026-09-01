@@ -33,8 +33,101 @@ export function getPool(): pg.Pool {
     connectionString,
     ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
     max: 4,
+    // A collection run spends 10+ minutes scraping between its first DB write
+    // (startRun) and its last (upsertJobs). Neon's proxy — and any NAT in
+    // between — drops a connection that has been silent that long, so keep the
+    // socket warm and reap idle clients quickly rather than handing a corpse
+    // back out on the next checkout.
+    keepAlive: true,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 15_000,
+  });
+  // MUST exist: node-postgres re-emits a dead idle client's socket error on the
+  // pool, and an unhandled 'error' event takes the whole process down (that is
+  // the `read ETIMEDOUT` crash that used to kill a run right after ranking).
+  // The client has already been evicted by the time we get here; nothing to do
+  // but note it and let the next checkout dial a fresh connection.
+  pool.on("error", (err) => {
+    process.stderr.write(`[db] idle client dropped: ${err instanceof Error ? err.message : String(err)}\n`);
   });
   return pool;
+}
+
+/** Connection-level failures that a retry on a fresh socket can plausibly fix. */
+function isTransient(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  if (code && ["ETIMEDOUT", "ECONNRESET", "EPIPE", "ENOTFOUND", "ECONNREFUSED", "EHOSTUNREACH",
+    "57P01" /* admin_shutdown */, "57P03" /* cannot_connect_now */, "08006", "08003", "08001"].includes(code)) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : "";
+  return /Connection terminated|connection closed|timeout exceeded|socket hang up/i.test(msg);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Run a DB unit of work, retrying once or twice if the connection (not the SQL)
+ * failed. Every write in a collection run is the tail of an expensive scrape —
+ * losing it to a stale socket means the whole run's work is thrown away.
+ */
+async function withRetry<T>(what: string, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err) || attempt === 2) throw err;
+      const wait = 500 * 2 ** attempt;
+      process.stderr.write(
+        `[db] ${what} failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait}ms\n`,
+      );
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
+/** pool.query with connection-level retry. */
+async function query(what: string, text: string, values?: unknown[]): Promise<pg.QueryResult> {
+  return withRetry(what, () => getPool().query(text, values as never));
+}
+
+/**
+ * Check out a client, run `fn` inside a transaction, and always put the client
+ * back. An error listener is attached for the duration: while a client is
+ * checked out the pool is NOT listening on it, so a socket error would
+ * otherwise be an unhandled 'error' event and crash the process. On failure the
+ * client is destroyed rather than returned to the pool.
+ */
+async function inTransaction<T>(what: string, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  return withRetry(what, async () => {
+    const client = await getPool().connect();
+    const onError = () => {}; // presence is the point; the query promise carries the error
+    client.on("error", onError);
+    try {
+      await client.query("BEGIN");
+      const out = await fn(client);
+      await client.query("COMMIT");
+      client.removeListener("error", onError);
+      client.release();
+      return out;
+    } catch (err) {
+      // ROLLBACK only over a connection that can still answer. When the failure
+      // IS the connection (backend terminated, socket dropped), the ROLLBACK is
+      // queued against a socket that will never reply and the promise never
+      // settles — that hangs the retry forever. Destroying the client rolls the
+      // transaction back server-side anyway. The race is a belt-and-braces
+      // bound for the in-between case (SQL error on a connection that then dies).
+      if (!isTransient(err)) {
+        await Promise.race([client.query("ROLLBACK").catch(() => {}), sleep(2_000)]);
+      }
+      client.removeListener("error", onError);
+      client.release(true); // destroy: this connection is not trustworthy
+      throw err;
+    }
+  });
 }
 
 export async function closePool(): Promise<void> {
@@ -75,11 +168,27 @@ export async function initSchema(): Promise<void> {
       tags             jsonb,
       cities           text[] DEFAULT '{}',
       run_date         date NOT NULL,
+      -- Surfaced without its JD ever being fetched: score is meaningless, the
+      -- UI shows a "JD not fetched" badge instead of a misleading 0% score.
+      jd_missing       boolean NOT NULL DEFAULT false,
+      -- Match % BEFORE penalties, and the reasons points were taken off.
+      -- Nothing is filtered out any more (src/filter.ts) — a weak job is a
+      -- low-scoring row with visible reasons, not a deletion.
+      base_score       integer,
+      penalties        jsonb,
       first_seen_at    timestamptz NOT NULL DEFAULT now(),
       last_seen_at     timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS jobs_run_date_idx ON jobs (run_date);
     CREATE INDEX IF NOT EXISTS jobs_score_idx    ON jobs (score DESC);
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS jd_missing boolean NOT NULL DEFAULT false;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS base_score integer;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS penalties  jsonb;
+    -- Which items of YOUR stack the JD names, and the points that overlap added
+    -- (CONFIG.stackProfile). Stored so the row can SHOW why it ranks where it
+    -- does — a bare score can't distinguish "React+TS and nothing else" from
+    -- "React+TS+Next+Tailwind+TanStack+Playwright+Vercel".
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stack      jsonb;
 
     CREATE TABLE IF NOT EXISTS runs (
       id            serial PRIMARY KEY,
@@ -113,11 +222,32 @@ export async function initSchema(): Promise<void> {
       score         integer,
       first_seen_at timestamptz NOT NULL DEFAULT now(),
       decided_at    timestamptz NOT NULL DEFAULT now(),
-      times_seen    integer NOT NULL DEFAULT 1
+      times_seen    integer NOT NULL DEFAULT 1,
+      -- Fingerprint of the scoring/filter config this verdict was made under
+      -- (src/fingerprint.ts). A rejection is only reusable while it matches.
+      config_hash   text
     );
     CREATE INDEX IF NOT EXISTS seen_cards_decided_idx ON seen_cards (decided_at);
+    ALTER TABLE seen_cards ADD COLUMN IF NOT EXISTS config_hash text;
   `;
-  await getPool().query(sql);
+  await query("initSchema", sql);
+}
+
+/**
+ * Chunk a list so one statement never exceeds Postgres' 65535-parameter limit
+ * (and stays a sane size to re-send on a retry).
+ */
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/** `($1,$2,…),($3,$4,…)` — one placeholder group per row of a multi-row INSERT. */
+function placeholders(rows: number, cols: number): string {
+  let n = 0;
+  return Array.from({ length: rows }, () =>
+    "(" + Array.from({ length: cols }, () => `$${++n}`).join(",") + ")").join(",");
 }
 
 /**
@@ -125,29 +255,58 @@ export async function initSchema(): Promise<void> {
  * first_seen_at, bumps last_seen_at, takes the HIGHER score, and unions the set
  * of search cities the posting surfaced under. Returns inserted vs updated counts
  * (via the xmax=0 "was this row just inserted?" trick).
+ *
+ * Rows go in a FEW multi-row statements, not one statement per job. Neon round
+ * trips cost ~300ms from here, so the old row-by-row loop held a transaction
+ * open for ~40s per 120 rows — which is both slow and the main reason a run
+ * ever met a dropped connection at all.
  */
 export async function upsertJobs(
   jobs: ScoredJob[],
   opts: { runDate: string; citiesByExternalId?: Map<string, string[]> },
-): Promise<{ inserted: number; updated: number }> {
-  if (!jobs.length) return { inserted: 0, updated: 0 };
-  const p = getPool();
-  const client = await p.connect();
-  let inserted = 0, updated = 0;
-  try {
-    await client.query("BEGIN");
-    for (const j of jobs) {
-      const cities = opts.citiesByExternalId?.get(j.externalId) ?? [];
+  /**
+   * `insertedIds` = external_ids that were genuinely NEW rows (Postgres
+   * `xmax = 0`), not refreshed sightings. The alerting path needs this: a good
+   * job is re-seen by every run inside its 2h window, so alerting on "score >=
+   * 70 in this batch" would re-fire the same banner for hours.
+   */
+): Promise<{ inserted: number; updated: number; insertedIds: string[] }> {
+  const insertedIds: string[] = [];
+  if (!jobs.length) return { inserted: 0, updated: 0, insertedIds };
+  // ON CONFLICT DO UPDATE cannot touch the same row twice in one statement, so
+  // collapse any duplicate externalId first (last sighting wins).
+  const byId = new Map<string, ScoredJob>();
+  for (const j of jobs) byId.set(j.externalId, j);
+  const unique = [...byId.values()];
+
+  // The whole transaction is the retry unit — it's a pure UPSERT, so replaying
+  // it is safe (the counters are re-derived from scratch on each attempt).
+  return inTransaction("upsertJobs", async (client) => {
+    let inserted = 0, updated = 0;
+    for (const batch of chunk(unique, 100)) {
+      const values: unknown[] = [];
+      for (const j of batch) {
+        values.push(
+          j.externalId, j.source, j.title, j.company ?? null, j.location ?? null,
+          j.url ?? null, j.description ?? null, j.postedAt ?? null, j.salary ?? null,
+          j.experience ?? null, j.remote ?? null, j.score ?? null,
+          j.tfidfScore ?? null, j.seniority ?? null, j.applyType ?? null,
+          j.applicants ?? null, j.hrName ?? null, j.hrProfileUrl ?? null,
+          j.salaryBand ? JSON.stringify(j.salaryBand) : null,
+          j.presence ? JSON.stringify(j.presence) : null,
+          JSON.stringify(j.tags ?? []), opts.citiesByExternalId?.get(j.externalId) ?? [],
+          opts.runDate, j.jdMissing ?? false,
+          j.baseScore ?? j.score ?? null, JSON.stringify(j.penalties ?? []),
+          JSON.stringify({ hits: j.stackHits ?? [], bonus: j.stackBonus ?? 0, anchored: j.stackAnchored ?? false, pure: j.stackPure ?? false }),
+        );
+      }
       const res = await client.query(
         `INSERT INTO jobs (
            external_id, source, title, company, location, url, description,
            posted_at, salary, experience, remote, score, tfidf_score, seniority,
            apply_type, applicants, hr_name, hr_profile_url, salary_band, presence,
-           tags, cities, run_date
-         ) VALUES (
-           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-           $21,$22,$23
-         )
+           tags, cities, run_date, jd_missing, base_score, penalties, stack
+         ) VALUES ${placeholders(batch.length, 27)}
          ON CONFLICT (external_id) DO UPDATE SET
            title          = EXCLUDED.title,
            company        = EXCLUDED.company,
@@ -175,29 +334,28 @@ export async function upsertJobs(
            presence       = COALESCE(EXCLUDED.presence, jobs.presence),
            cities         = ARRAY(SELECT DISTINCT unnest(COALESCE(jobs.cities,'{}') || EXCLUDED.cities)),
            run_date       = EXCLUDED.run_date,
+           -- Once ANY sighting has read the JD, the row is no longer "unread".
+           jd_missing     = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
+                                 THEN false ELSE jobs.jd_missing END,
+           -- Penalties travel with the score: refresh both only when this
+           -- sighting actually read the JD.
+           base_score     = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
+                                 THEN EXCLUDED.base_score ELSE jobs.base_score END,
+           penalties      = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
+                                 THEN EXCLUDED.penalties ELSE jobs.penalties END,
+           stack          = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
+                                 THEN EXCLUDED.stack ELSE jobs.stack END,
            last_seen_at   = now()
-         RETURNING (xmax = 0) AS inserted`,
-        [
-          j.externalId, j.source, j.title, j.company ?? null, j.location ?? null,
-          j.url ?? null, j.description ?? null, j.postedAt ?? null, j.salary ?? null,
-          j.experience ?? null, j.remote ?? null, j.score ?? null,
-          j.tfidfScore ?? null, j.seniority ?? null, j.applyType ?? null,
-          j.applicants ?? null, j.hrName ?? null, j.hrProfileUrl ?? null,
-          j.salaryBand ? JSON.stringify(j.salaryBand) : null,
-          j.presence ? JSON.stringify(j.presence) : null,
-          JSON.stringify(j.tags ?? []), cities, opts.runDate,
-        ],
+         RETURNING external_id, (xmax = 0) AS inserted`,
+        values,
       );
-      if (res.rows[0]?.inserted) inserted++; else updated++;
+      for (const r of res.rows) {
+        if (r.inserted) { inserted++; insertedIds.push(r.external_id as string); }
+        else updated++;
+      }
     }
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-  return { inserted, updated };
+    return { inserted, updated, insertedIds };
+  });
 }
 
 /** A card the collector has already read and ruled on. See `seen_cards` above. */
@@ -206,14 +364,17 @@ export interface SeenCard {
   description: string;
   decision: "shortlisted" | "dropped";
   decidedAt: Date;
+  /** Config fingerprint the verdict was made under; null for pre-upgrade rows. */
+  configHash: string | null;
 }
 
 /** Look up prior verdicts for a batch of card ids. Missing ids = never read. */
 export async function getSeenCards(externalIds: string[]): Promise<Map<string, SeenCard>> {
   const out = new Map<string, SeenCard>();
   if (!externalIds.length) return out;
-  const { rows } = await getPool().query(
-    `SELECT external_id, description, decision, decided_at
+  const { rows } = await query(
+    "getSeenCards",
+    `SELECT external_id, description, decision, decided_at, config_hash
        FROM seen_cards WHERE external_id = ANY($1)`,
     [externalIds],
   );
@@ -223,6 +384,7 @@ export async function getSeenCards(externalIds: string[]): Promise<Map<string, S
       description: r.description ?? "",
       decision: r.decision === "shortlisted" ? "shortlisted" : "dropped",
       decidedAt: new Date(r.decided_at),
+      configHash: r.config_hash ?? null,
     });
   }
   return out;
@@ -234,17 +396,24 @@ export async function getSeenCards(externalIds: string[]): Promise<Map<string, S
  * and bumps `times_seen`; `first_seen_at` is preserved.
  */
 export async function recordSeenCards(
-  entries: { externalId: string; title: string; company?: string; description: string; decision: "shortlisted" | "dropped"; reason?: string; score?: number }[],
+  entries: { externalId: string; title: string; company?: string; description: string; decision: "shortlisted" | "dropped"; reason?: string; score?: number; configHash?: string }[],
 ): Promise<void> {
   if (!entries.length) return;
-  const p = getPool();
-  const client = await p.connect();
-  try {
-    await client.query("BEGIN");
-    for (const e of entries) {
+  // Same story as upsertJobs: batch the rows, and collapse duplicate ids first
+  // (ON CONFLICT DO UPDATE may not hit the same row twice in one statement).
+  const byId = new Map<string, (typeof entries)[number]>();
+  for (const e of entries) byId.set(e.externalId, e);
+
+  await inTransaction("recordSeenCards", async (client) => {
+    for (const batch of chunk([...byId.values()], 400)) {
+      const values: unknown[] = [];
+      for (const e of batch) {
+        values.push(e.externalId, e.title, e.company ?? null, e.description, e.decision,
+          e.reason ?? null, e.score ?? null, e.configHash ?? null);
+      }
       await client.query(
-        `INSERT INTO seen_cards (external_id, title, company, description, decision, reason, score)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `INSERT INTO seen_cards (external_id, title, company, description, decision, reason, score, config_hash)
+         VALUES ${placeholders(batch.length, 8)}
          ON CONFLICT (external_id) DO UPDATE SET
            title       = EXCLUDED.title,
            company     = EXCLUDED.company,
@@ -252,30 +421,26 @@ export async function recordSeenCards(
            decision    = EXCLUDED.decision,
            reason      = EXCLUDED.reason,
            score       = EXCLUDED.score,
+           config_hash = EXCLUDED.config_hash,
            decided_at  = now(),
            times_seen  = seen_cards.times_seen + 1`,
-        [e.externalId, e.title, e.company ?? null, e.description, e.decision, e.reason ?? null, e.score ?? null],
+        values,
       );
     }
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 /** All jobs for a run day, ranked by match %. Rows are camelCase-ish for the UI. */
 export async function getJobsForDate(date: string): Promise<Record<string, unknown>[]> {
-  const { rows } = await getPool().query(
+  const { rows } = await query(
+    "getJobsForDate",
     // `description` (the full JD, several KB per row) is deliberately NOT
     // selected: the table never renders it, and shipping it made this endpoint
     // ~175KB and tens of seconds over Neon. Fetch it per-job if ever needed.
     `SELECT external_id, source, title, company, location, url,
             posted_at, salary, experience, remote, score, tfidf_score, seniority,
             apply_type, applicants, hr_name, hr_profile_url, salary_band, presence,
-            cities, first_seen_at, last_seen_at
+            cities, jd_missing, base_score, penalties, stack, first_seen_at, last_seen_at
        FROM jobs
       WHERE run_date = $1
       ORDER BY score DESC NULLS LAST, last_seen_at DESC`,
@@ -288,11 +453,19 @@ export async function startRun(meta: {
   runDate: string;
   trigger: "auto" | "manual";
   windowHours: number;
+  /**
+   * Which collector this run belongs to. Defaults to 'linkedin' to match the
+   * column default and every run recorded before the ATS collector existed —
+   * without it the two schedulers' runs are indistinguishable in the status
+   * strip, and an ATS tick every 15 min would drown the half-hourly city runs.
+   */
+  source?: string;
 }): Promise<number> {
-  const { rows } = await getPool().query(
-    `INSERT INTO runs (run_date, trigger, window_hours, status)
-     VALUES ($1, $2, $3, 'running') RETURNING id`,
-    [meta.runDate, meta.trigger, meta.windowHours],
+  const { rows } = await query(
+    "startRun",
+    `INSERT INTO runs (run_date, trigger, window_hours, status, source)
+     VALUES ($1, $2, $3, 'running', $4) RETURNING id`,
+    [meta.runDate, meta.trigger, meta.windowHours, meta.source ?? "linkedin"],
   );
   return rows[0].id as number;
 }
@@ -309,7 +482,8 @@ export async function finishRun(
     error?: string;
   },
 ): Promise<void> {
-  await getPool().query(
+  await query(
+    "finishRun",
     `UPDATE runs SET
        finished_at = now(), status = $2, fetched = $3, prefiltered = $4,
        enriched = $5, final = $6, new_jobs = $7, error = $8
@@ -320,7 +494,8 @@ export async function finishRun(
 }
 
 export async function getRunsForDate(date: string): Promise<Record<string, unknown>[]> {
-  const { rows } = await getPool().query(
+  const { rows } = await query(
+    "getRunsForDate",
     `SELECT id, started_at, finished_at, trigger, window_hours, fetched,
             prefiltered, enriched, final, new_jobs, status, error
        FROM runs WHERE run_date = $1 ORDER BY started_at DESC`,

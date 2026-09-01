@@ -26,6 +26,15 @@ export interface KeywordHit {
   weight: number;
 }
 
+/**
+ * One reason a job lost points, e.g. { label: "needs 8+ yrs", points: 40 }.
+ * Nothing is filtered out of the results any more — see src/filter.ts.
+ */
+export interface Penalty {
+  label: string;
+  points: number;
+}
+
 export interface ScoredJob extends Job {
   matched: KeywordHit[];
   unmatched: string[]; // labels of weighted keywords NOT found
@@ -33,8 +42,28 @@ export interface ScoredJob extends Job {
   seniority: "favored" | "stretch" | "unknown";
   /** What kind of role the TITLE describes — sets the score's title multiplier. */
   titleClass?: "frontend" | "fullstack" | "generic";
+  /** Title itself says React/Next.js/Frontend — score was floored (relevance.titleBoost). */
+  titleBoosted?: boolean;
+  /** JD names React/TS and asks for NO foreign backend stack (relevance.purity). */
+  stackPure?: boolean;
   /** Backend technology groups the JD asks for; each one discounts the score. */
   backendGroups?: string[];
+  /**
+   * True when this job was surfaced WITHOUT its JD ever being fetched (past the
+   * enrich cap, or the detail request failed). Its score is meaningless — judge
+   * it from the link. A later run fetches and scores it properly.
+   */
+  jdMissing?: boolean;
+  /** Match % BEFORE penalties, so the UI can show "78 → 33" and why. */
+  baseScore?: number;
+  /** Items of YOUR stack this JD names (CONFIG.stackProfile), as a set. */
+  stackHits?: string[];
+  /** Points the stack overlap added to the score. 0 when the anchor gate is shut. */
+  stackBonus?: number;
+  /** Did the JD name React or TypeScript? False ⇒ stackBonus is 0 by rule. */
+  stackAnchored?: boolean;
+  /** Why this job lost points. Empty = nothing held against it. */
+  penalties?: Penalty[];
   tfidfScore?: number; // 0–1 TF-IDF cosine similarity vs resume (set after enrichment)
   salaryBand?: SalaryBand; // crowd-sourced market band (AmbitionBox), absent if unresolved
   presence?: PresenceSignals; // online-footprint evidence; ONLY set when AmbitionBox had no page

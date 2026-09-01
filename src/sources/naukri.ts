@@ -72,10 +72,16 @@ export const naukriSource: Source = {
             location: loc,
             l: loc,
             pageNo: String(page),
-            sort: "f", // freshness
-            experience: String(CONFIG.experience.years), // server-side: only bands bracketing this
+            // Relevance, not freshness — `keyword` matches title + skills + JD, and
+            // freshness-order floats whichever bulk poster posted last to the top.
+            // Same reasoning (and measurement) as src/search.ts naukriUrl().
+            sort: "r",
             [CONFIG.freshness.naukri_param]: CONFIG.freshness.naukri_value, // jobAge=1 (last day)
           });
+          // Off by default — see CONFIG.experience.naukriYears. Naukri keeps only
+          // bands that BRACKET the value, which drops wide/senior-banded frontend
+          // roles outright; filter.ts does the seniority cut client-side instead.
+          if (CONFIG.experience.naukriYears !== null) p.set("experience", String(CONFIG.experience.naukriYears));
           const url = `${CONFIG.endpoints.naukri}?${p.toString()}`;
           let body: string;
           try {
@@ -83,7 +89,9 @@ export const naukriSource: Source = {
               // Fresh nkparam per request (and politeFetch retries reuse this; on a
               // hard 406 a re-run mints anew). Token is single-use by design.
               headers: { ...CONFIG.naukriHeaders, nkparam: mintNkparam(), Accept: "application/json" },
-              cacheKey: `naukri:${term}:${loc}:${page}:e${CONFIG.experience.years}`,
+              // `sort` and `experience` are part of the key: those are different
+              // result sets, not stale copies of the same one.
+              cacheKey: `naukri:${term}:${loc}:${page}:e${CONFIG.experience.naukriYears ?? "any"}:r`,
               label: `naukri "${term}" @ ${loc} p${page}`,
             });
           } catch (err) {

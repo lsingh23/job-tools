@@ -6,7 +6,7 @@
 // MEANING and using the résumé for open-ended ones. No data is stored here.
 
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, statSync, copyFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,10 +15,12 @@ import { loadPrompt } from "./prompts.mjs";
 import { recordOutcome, insights } from "./feedback.mjs";
 import { tailor } from "./tailor.mjs";
 import { saveEdited, MASTER } from "./editor.mjs";
-import { docxToPdf, pdfPageCount, canRenderPdf } from "./docx.mjs";
+import { docxToPdf, pdfPageCount, canRenderPdf, writePatchedDocx } from "./docx.mjs";
+import { renderEditable, applyTextEdits } from "./wysiwyg.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TAILORED_DIR = path.join(HERE, "tailored");
+const PROBES_DIR = path.join(HERE, "probes");
 
 // Fallback résumé Autofill attaches when nothing tailored is cached. Override with DEFAULT_RESUME.
 const DEFAULT_RESUME = process.env.DEFAULT_RESUME ?? "/Users/lakhveer/Lakhveer/Frontend Engineer/Lakhveer Singh Resume.pdf";
@@ -46,18 +48,20 @@ function listResumes() {
   return out.sort((a, b) => (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
 }
 
-// Recruiter-style output filename: "Lakhveer Singh - <Company> - <YYYY-MM-DD>.docx".
+// Recruiter-style output filename: "Lakhveer Singh Resume - <Company> - <YYYY-MM-DD>.docx".
 const safe = (s) => String(s || "").replace(/[^\w .()&-]+/g, " ").replace(/\s+/g, " ").trim();
 const today = () => new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD, local time
-const outputName = (company) => `Lakhveer Singh - ${company ? safe(company) : "Tailored"} - ${today()}.docx`;
+const outputName = (company) => `Lakhveer Singh Resume - ${company ? safe(company) : "Tailored"} - ${today()}.docx`;
 
 // Build a .docx from edits at destDocx, render it to PDF, return the PDF as base64 + page count.
 // highlight:true shades changed paragraphs (review preview); false = clean final résumé.
-function buildAndRender(edits, destDocx, { highlight }) {
+// keepPdfAt (optional) copies the rendered PDF there before the temp render dir is cleaned up.
+function buildAndRender(edits, destDocx, { highlight, keepPdfAt = null }) {
   saveEdited(edits, destDocx, MASTER, { highlight });
   const dir = mkdtempSync(path.join(tmpdir(), "tailor-pdf-"));
   try {
     const pdf = docxToPdf(destDocx, dir);
+    if (keepPdfAt) copyFileSync(pdf, keepPdfAt);
     return { pdf_base64: readFileSync(pdf).toString("base64"), pages: pdfPageCount(pdf) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -69,6 +73,46 @@ const toEdits = (arr) =>
   (Array.isArray(arr) ? arr : [])
     .map((e) => ({ id: String(e?.id || ""), text: typeof e?.text === "string" ? e.text : String(e?.new_text ?? "") }))
     .filter((e) => /^p\d+$/.test(e.id));
+
+// ── WYSIWYG résumé editor (applier/wysiwyg.html) ────────────────────────────────
+// Editable sources: the master, plus anything already saved in tailored/. A source key is
+// "master" or "tailored/<file>.docx"; nothing else resolves, so the editor can't reach outside.
+function editorSources() {
+  const out = [{ key: "master", label: `${path.basename(MASTER)} (master)` }];
+  if (existsSync(TAILORED_DIR)) {
+    const docx = readdirSync(TAILORED_DIR)
+      .filter((f) => f.toLowerCase().endsWith(".docx") && !f.startsWith("~$"))
+      .map((f) => ({ f, mtime: statSync(path.join(TAILORED_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const { f } of docx) out.push({ key: `tailored/${f}`, label: f.replace(/\.docx$/i, "") });
+  }
+  return out;
+}
+
+function resolveSource(key) {
+  if (!key || key === "master") return MASTER;
+  const m = /^tailored\/(.+\.docx)$/i.exec(String(key));
+  if (!m) throw new Error(`unknown source: ${key}`);
+  const abs = path.resolve(TAILORED_DIR, m[1]);
+  if (path.dirname(abs) !== path.resolve(TAILORED_DIR)) throw new Error("path outside tailored/");
+  if (!existsSync(abs)) throw new Error(`not found: ${key}`);
+  return abs;
+}
+
+// Apply the editor's text edits to `srcPath` and render the result. Writes destDocx (the styled,
+// lossless .docx) and returns the PDF bytes; keepPdfAt also drops the .pdf next to it.
+function renderEdited(srcPath, edits, destDocx, keepPdfAt = null) {
+  const { xml, changed } = applyTextEdits(srcPath, edits && typeof edits === "object" ? edits : {});
+  writePatchedDocx(srcPath, xml, destDocx);
+  const dir = mkdtempSync(path.join(tmpdir(), "wys-pdf-"));
+  try {
+    const pdf = docxToPdf(destDocx, dir);
+    if (keepPdfAt) copyFileSync(pdf, keepPdfAt);
+    return { pdf_base64: readFileSync(pdf).toString("base64"), pages: pdfPageCount(pdf), changed };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 const PORT = Number(process.env.APPLIER_PORT ?? 8787);
 
@@ -254,18 +298,23 @@ const server = createServer(async (req, res) => {
     return;
   }
   // Save the final résumé: clean styled .docx to applier/tailored/, plus the clean PDF (base64)
-  // for Autofill to attach to form résumé fields.
+  // for Autofill to attach to form résumé fields. `filename` (from the review modal's name box)
+  // wins over the auto "Name - Company - date" template.
   if (req.method === "POST" && req.url === "/tailor/save") {
     try {
-      const { edits = [], company = "" } = JSON.parse((await readBody(req)) || "{}");
+      const { edits = [], company = "", filename: nameOverride = "" } = JSON.parse((await readBody(req)) || "{}");
       if (!canRenderPdf()) { send(res, 500, { error: "LibreOffice (soffice) not found" }); return; }
       mkdirSync(TAILORED_DIR, { recursive: true });
-      const filename = outputName(company);
+      // The review modal names the file (it's what the recruiter sees); fall back to the
+      // Company/date template when nothing was typed.
+      const chosen = safe(String(nameOverride).replace(/\.(pdf|docx)$/i, ""));
+      const filename = chosen ? `${chosen}.docx` : outputName(company);
       const destDocx = path.join(TAILORED_DIR, filename);
-      const rendered = buildAndRender(toEdits(edits), destDocx, { highlight: false });
+      const destPdf = destDocx.replace(/\.docx$/i, ".pdf");
+      const rendered = buildAndRender(toEdits(edits), destDocx, { highlight: false, keepPdfAt: destPdf });
       if (rendered.pages > 1) console.warn(`[tailor/save] WARNING: ${filename} rendered ${rendered.pages} pages`);
       console.log(`[tailor/save] wrote ${destDocx} (${rendered.pages}p)`);
-      send(res, 200, { ...rendered, filename, docx_path: destDocx });
+      send(res, 200, { ...rendered, filename, docx_path: destDocx, pdf_path: destPdf });
     } catch (err) { console.error("[tailor/save]", err.message); send(res, 500, { error: String(err.message || err) }); }
     return;
   }
@@ -298,6 +347,83 @@ const server = createServer(async (req, res) => {
       if (!existsSync(abs)) { send(res, 404, { error: `not found: ${rel}` }); return; }
       send(res, 200, { name: path.basename(abs), type: "application/pdf", b64: readFileSync(abs).toString("base64") });
     } catch (err) { console.error("[resume]", err.message); send(res, 500, { error: String(err.message || err) }); }
+    return;
+  }
+  // ── WYSIWYG editor ────────────────────────────────────────────────────────────
+  // The page itself: open http://127.0.0.1:8787/wysiwyg
+  if (req.method === "GET" && (req.url === "/wysiwyg" || req.url.startsWith("/wysiwyg?"))) {
+    try {
+      const html = readFileSync(path.join(HERE, "wysiwyg.html"));
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.end(html);
+    } catch (err) { console.error("[wysiwyg]", err.message); send(res, 500, { error: String(err.message || err) }); }
+    return;
+  }
+  // The résumé as editable HTML — real page geometry, one contenteditable span per <w:t>.
+  if (req.method === "GET" && req.url.startsWith("/wysiwyg/doc")) {
+    try {
+      const key = new URL(req.url, "http://x").searchParams.get("src") || "master";
+      const srcPath = resolveSource(key);
+      const doc = renderEditable(srcPath);
+      send(res, 200, {
+        ...doc,
+        src: key === "" ? "master" : key,
+        sources: editorSources(),
+        suggested_name: outputName("").replace(/\.docx$/i, ""),
+      });
+    } catch (err) { console.error("[wysiwyg/doc]", err.message); send(res, 400, { error: String(err.message || err) }); }
+    return;
+  }
+  // Ground truth: render the current edit state through LibreOffice, exactly as saving would.
+  if (req.method === "POST" && req.url === "/wysiwyg/preview") {
+    try {
+      const { src = "master", edits = {} } = JSON.parse((await readBody(req)) || "{}");
+      if (!canRenderPdf()) { send(res, 500, { error: "LibreOffice (soffice) not found — needed for PDF rendering" }); return; }
+      const dir = mkdtempSync(path.join(tmpdir(), "wys-prev-"));
+      try { send(res, 200, renderEdited(resolveSource(src), edits, path.join(dir, "preview.docx"))); }
+      finally { rmSync(dir, { recursive: true, force: true }); }
+    } catch (err) { console.error("[wysiwyg/preview]", err.message); send(res, 500, { error: String(err.message || err) }); }
+    return;
+  }
+  // Save under a new name: applier/tailored/<name>.pdf (+ the .docx it was rendered from, which
+  // is what you re-open to edit again — a PDF alone can't be edited losslessly).
+  if (req.method === "POST" && req.url === "/wysiwyg/save") {
+    try {
+      const { src = "master", edits = {}, name = "", overwrite = false } = JSON.parse((await readBody(req)) || "{}");
+      if (!canRenderPdf()) { send(res, 500, { error: "LibreOffice (soffice) not found" }); return; }
+      const base = safe(String(name).replace(/\.(pdf|docx)$/i, ""));
+      if (!base) { send(res, 400, { error: "name is required" }); return; }
+      const srcPath = resolveSource(src);
+      mkdirSync(TAILORED_DIR, { recursive: true });
+      const destDocx = path.join(TAILORED_DIR, `${base}.docx`);
+      const destPdf = path.join(TAILORED_DIR, `${base}.pdf`);
+      if (!overwrite && (existsSync(destPdf) || existsSync(destDocx))) {
+        send(res, 409, { error: `"${base}" already exists in tailored/` });
+        return;
+      }
+      const r = renderEdited(srcPath, edits, destDocx, destPdf);
+      if (r.pages > 1) console.warn(`[wysiwyg/save] WARNING: ${base} rendered ${r.pages} pages`);
+      console.log(`[wysiwyg/save] ${r.changed} edits → ${destPdf} (${r.pages}p)`);
+      send(res, 200, { ...r, name: base, pdf_path: destPdf, docx_path: destDocx, src_key: `tailored/${base}.docx` });
+    } catch (err) { console.error("[wysiwyg/save]", err.message); send(res, 500, { error: String(err.message || err) }); }
+    return;
+  }
+  // 🔍 Probe — a structural DOM snapshot from the userscript (no field values, by design):
+  // how the form in front of you is actually built. Written to applier/probes/ so an
+  // unsupported flow (LinkedIn Easy Apply's multi-step modal, an odd ATS) can be implemented
+  // against real markup. One file per probe, named <host>-<timestamp>.json.
+  if (req.method === "POST" && req.url === "/probe") {
+    try {
+      const { snapshot } = JSON.parse((await readBody(req)) || "{}");
+      if (!snapshot || typeof snapshot !== "object") { send(res, 400, { error: "snapshot is required" }); return; }
+      mkdirSync(PROBES_DIR, { recursive: true });
+      const host = safe(String(snapshot.host || "page")).replace(/\s+/g, "") || "page";
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const file = `${host}-${stamp}.json`;
+      writeFileSync(path.join(PROBES_DIR, file), JSON.stringify(snapshot, null, 2));
+      console.log(`[probe] ${file} — ${(snapshot.fields || []).length} fields, ${(snapshot.files || []).length} uploads, dialog: ${snapshot.dialog ? snapshot.dialog.heading || "yes" : "none"}`);
+      send(res, 200, { ok: true, file, dir: PROBES_DIR });
+    } catch (err) { console.error("[probe]", err.message); send(res, 500, { error: String(err.message || err) }); }
     return;
   }
   // Feedback loop — the "what to learn next" table: gap keywords ranked by cost + callback stats.

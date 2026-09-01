@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Autofill — LLM (universal)
 // @namespace    lakhveer.job-tools
-// @version      6.6
+// @version      6.8
 // @description  Works on ANY ATS with no per-site setup. One knowledge base (résumé + contact
 //               + Q&A). Each field — text, textarea, dropdown or radio group: exact Q&A match →
 //               fill instantly; else the local LLM answers it by meaning, picking from the
@@ -14,6 +14,13 @@
 //               .docx and shown as a live PDF preview with changed lines highlighted. You correct
 //               anything, watch the preview update, then Save & Attach — a clean .docx lands in
 //               applier/tailored/ and the clean PDF is cached for Autofill to attach. Learns Q&A.
+//               ⚡ Autofill runs the WHOLE apply sequence in the order a human does it: tailor to
+//               the cached JD → you review and name it → Attach uploads the PDF → wait for the
+//               site's résumé parser → fill every field it left empty. When an apply MODAL is
+//               open (LinkedIn Easy Apply, overlay ATSs) that modal is the form — the page
+//               behind it is never filled. 🔍 Probe dumps a form's STRUCTURE (never your
+//               answers) to applier/probes/ so an unsupported flow can be built against real
+//               markup. Page reads are layout-free: innerText per element froze LinkedIn.
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -117,6 +124,8 @@
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
+  // Any of these marks a modal; Easy Apply is `[role=dialog]` inside `.artdeco-modal`.
+  const DIALOG_SEL = '[role="dialog"], dialog, .artdeco-modal, [aria-modal="true"]';
   const mark = (el, c, title) => { el.style.outline = `2px solid ${c}`; el.style.outlineOffset = "1px"; if (title) el.title = title; };
 
   // True while WE are writing to the page. Every auto-write holds this across the whole
@@ -259,8 +268,23 @@
     return els[0].name || "";
   }
 
+  // Where the form we're working on lives. An apply flow rendered in a modal — LinkedIn
+  // Easy Apply, iCIMS/Greenhouse overlays — sits on top of a page that is itself full of
+  // controls (a search box, a newsletter signup, the feed). Filling those is wrong and
+  // visibly weird, so once a real form modal is open it becomes the root and nothing
+  // outside it is touched. "Real" means it actually holds controls: cookie banners and
+  // toasts are dialogs too, and scoping into one of those would blind us to the whole page.
+  function formRoot() {
+    const dialogs = [...document.querySelectorAll(DIALOG_SEL)].filter(visible);
+    for (let i = dialogs.length - 1; i >= 0; i--) {                     // topmost first
+      const d = dialogs[i];
+      if (d.querySelectorAll("input, textarea, select").length >= 2) return d;
+    }
+    return document;
+  }
+
   function collectFields() {
-    const all = [...document.querySelectorAll("input, textarea, select")].filter(visible);
+    const all = [...formRoot().querySelectorAll("input, textarea, select")].filter(visible);
     const fields = [], radios = new Map();
     for (const el of all) {
       if ((el.type || "").toLowerCase() === "radio") {
@@ -353,7 +377,7 @@
   // answerable fields are — doing that is why attaching silently never happened. A hidden
   // input also rarely has a <label>: the words "Attach Resume" live in a sibling <span>.
   // So score each file input on the text AROUND it, not on its own label.
-  const fileInputs = () => [...document.querySelectorAll('input[type="file"]')].filter((el) => !el.disabled);
+  const fileInputs = () => [...formRoot().querySelectorAll('input[type="file"]')].filter((el) => !el.disabled);
 
   // The text a human would read as belonging to THIS upload control. Stop climbing at any
   // ancestor holding another file input: past that point we'd blend a neighbouring
@@ -544,15 +568,27 @@
   // ── résumé tailoring ── JD → ranked keywords + manual text editor → styled .docx ───
   // Grab a plausible job description from the page: the current selection if the user highlighted
   // it, else the largest text block on the page (job posts are one big description container).
+  //
+  // PERFORMANCE, and it is not a detail: reading `innerText` FORCES A SYNCHRONOUS STYLE +
+  // LAYOUT FLUSH, because it means "the text as rendered". Doing that once per element over
+  // every <div> on a LinkedIn-sized SPA is thousands of forced reflows back to back — the
+  // main thread stops and the whole tab freezes for many seconds. (That's the "LinkedIn
+  // blocks the script" symptom; nothing is blocking us, we're locking the page ourselves.)
+  // So measure candidates with `textContent`, which is a pure DOM string read and triggers
+  // NO layout, and pay for `innerText` exactly once — on the winner — to get its rendered
+  // line breaks, which the tailoring prompt reads much better than run-together text.
+  const JD_SCAN_CAP = 1500;                       // hard ceiling on elements measured
   function grabJd() {
     const sel = String(window.getSelection?.() || "").trim();
     if (sel.length > 200) return sel;
-    let best = "", bestLen = 0;
+    let best = null, bestLen = 0, n = 0;
     for (const el of document.querySelectorAll("main, article, section, div")) {
-      const t = (el.innerText || "").trim();
-      if (t.length > bestLen && t.length < 12000) { best = t; bestLen = t.length; }
+      if (++n > JD_SCAN_CAP) break;
+      const len = (el.textContent || "").trim().length;
+      if (len > bestLen && len < 12000) { best = el; bestLen = len; }
     }
-    return best || (document.body?.innerText || "").trim().slice(0, 12000);
+    const t = best ? (best.innerText || best.textContent || "").trim() : "";
+    return t || (document.body?.textContent || "").trim().slice(0, 12000);
   }
 
   // Cache the tailored PDF as the résumé Autofill attaches to form file fields — no download.
@@ -662,7 +698,9 @@
     });
   }
 
-  function tailorFlow() {
+  // opts.auto — opened by ⚡ Autofill (no cached JD to work from), so the review it leads
+  // into continues the run after Attach.
+  function tailorFlow(opts = {}) {
     const ov = document.createElement("div");
     ov.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font:13px system-ui";
     ov.innerHTML =
@@ -676,7 +714,7 @@
       `<textarea id="jf-jd" placeholder="Job description…" style="width:100%;height:24vh;box-sizing:border-box;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font:12px ui-monospace,monospace"></textarea>` +
       `<div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end;align-items:center">` +
         `<span id="jf-tstatus" style="margin-right:auto;opacity:.8"></span>` +
-        `<button id="jf-tcancel" style="cursor:pointer;background:#334155;color:#fff;border:0;border-radius:6px;padding:6px 12px">Close</button>` +
+        `<button id="jf-tcancel" style="cursor:pointer;background:#334155;color:#fff;border:0;border-radius:6px;padding:6px 12px">${opts.auto ? "Skip → fill form" : "Close"}</button>` +
         `<button id="jf-tgo" style="cursor:pointer;background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-weight:600">Tailor &amp; preview</button>` +
       `</div></div>`;
     document.body.appendChild(ov);
@@ -715,7 +753,13 @@
     }
     renderJdBanner();
     const tstatus = ov.querySelector("#jf-tstatus");
-    ov.querySelector("#jf-tcancel").onclick = () => ov.remove();
+    ov.querySelector("#jf-tcancel").onclick = () => {
+      ov.remove();
+      if (!opts.auto) return;
+      tailorSkipped = true;                    // don't re-prompt on this page
+      setStatus("tailoring skipped — filling fields…");
+      fillPass().catch((e) => setStatus("error: " + e.message));
+    };
     ov.querySelector("#jf-tgo").onclick = async () => {
       const jd = ov.querySelector("#jf-jd").value.trim();
       if (jd.length < 100) { tstatus.textContent = "paste a fuller job description first"; return; }
@@ -724,7 +768,7 @@
       const r = await postJSON("/tailor", { jd });
       go.disabled = false;
       if (r.error) { tstatus.textContent = "⚠️ " + r.error; return; }
-      renderReview(ov, r, ov.querySelector("#jf-co").value.trim(), ov.querySelector("#jf-ti").value.trim());
+      renderReview(ov, r, ov.querySelector("#jf-co").value.trim(), ov.querySelector("#jf-ti").value.trim(), opts);
     };
   }
 
@@ -732,7 +776,19 @@
   // (AI edits pre-applied, changed lines flagged yellow); right = the live PDF preview with the
   // same changes highlighted. Edit any line → preview re-renders (debounced). Save & Attach writes
   // a CLEAN styled .docx to applier/tailored/ and caches the CLEAN PDF for Autofill to attach.
-  function renderReview(ov, r, company, title) {
+  // Recruiter-facing filename the review modal proposes: "<your name> Resume - <Company> - <date>".
+  // You can type anything; the server slugs it and appends .docx/.pdf.
+  const dateStamp = () => new Date().toLocaleDateString("en-CA");                 // YYYY-MM-DD
+  const suggestName = (company) => {
+    const who = (profile.contact.full_name || "").trim() ||
+      [profile.contact.first_name, profile.contact.last_name].filter(Boolean).join(" ").trim() || "Lakhveer Singh";
+    const co = String(company || "").replace(/[^\w .()&-]+/g, " ").replace(/\s+/g, " ").trim();
+    return `${who} Resume - ${co || "Tailored"} - ${dateStamp()}`;
+  };
+
+  // opts.auto — this review was opened BY ⚡ Autofill, so attaching continues the run
+  // (parser wait → fill pass) instead of just closing.
+  function renderReview(ov, r, company, title, opts = {}) {
     const box = ov.querySelector("#jf-ebox");
     let lastFocused = null;                 // most-recently focused row (for click-to-insert)
     let previewUrl = pdfObjectUrl(r.pdf_base64 || "");
@@ -790,9 +846,17 @@
           `<iframe id="jf-pv" style="flex:1;width:100%;border:0;background:#fff" src="${previewUrl}"></iframe>` +
         `</div>` +
       `</div>` +
-      `<div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end;align-items:center">` +
+      `<div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap">` +
         `<span id="jf-estatus" style="margin-right:auto;opacity:.8"></span>` +
-        `<button id="jf-esave" style="cursor:pointer;background:#22c55e;color:#052e16;border:0;border-radius:6px;padding:7px 14px;font-weight:700">✓ Save &amp; attach (.docx local · PDF to form)</button>` +
+        `<label for="jf-ename" style="opacity:.6">Save as</label>` +
+        `<input id="jf-ename" placeholder="Name this résumé…" ` +
+          `style="width:min(320px,40vw);box-sizing:border-box;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px">` +
+        (opts.auto
+          ? `<button id="jf-eskip" title="attach nothing tailored — go straight to filling the form" ` +
+            `style="cursor:pointer;background:#334155;color:#fff;border:0;border-radius:6px;padding:7px 12px">Skip → fill form</button>`
+          : "") +
+        `<button id="jf-esave" style="cursor:pointer;background:#22c55e;color:#052e16;border:0;border-radius:6px;padding:7px 14px;font-weight:700">` +
+          (opts.auto ? `📎 Attach &amp; continue autofill` : `✓ Save &amp; attach (.docx local · PDF to form)`) + `</button>` +
       `</div>`;
 
     const estatus = box.querySelector("#jf-estatus");
@@ -884,10 +948,35 @@
     recompute();
     box.querySelector("#jf-pvrefresh").onclick = () => { clearTimeout(renderTimer); renderPreview(); };
     box.querySelector("#jf-eclose").onclick = () => { URL.revokeObjectURL(previewUrl); ov.remove(); };
-    box.querySelector("#jf-esave").onclick = async () => {
-      const save = box.querySelector("#jf-esave"); save.disabled = true;
+
+    // The name box gates attaching: nothing is written to applier/tailored/ (or uploaded)
+    // until this résumé has a name you chose.
+    const nameField = box.querySelector("#jf-ename");
+    const save = box.querySelector("#jf-esave");
+    nameField.value = suggestName(company || title);
+    const syncName = () => {
+      const ok = !!nameField.value.trim();
+      save.disabled = !ok;
+      save.style.opacity = ok ? "1" : ".45";
+      save.style.cursor = ok ? "pointer" : "not-allowed";
+    };
+    nameField.addEventListener("input", syncName);
+    syncName();
+
+    const skip = box.querySelector("#jf-eskip");
+    if (skip) skip.onclick = () => {
+      URL.revokeObjectURL(previewUrl); ov.remove();
+      tailorSkipped = true;
+      setStatus("tailoring skipped — filling fields…");
+      fillPass().catch((e) => setStatus("error: " + e.message));
+    };
+
+    save.onclick = async () => {
+      const filename = nameField.value.trim();
+      if (!filename) { estatus.textContent = "name the résumé first"; nameField.focus(); return; }
+      save.disabled = true;
       estatus.textContent = "saving clean .docx + rendering PDF…";
-      const resp = await postJSON("/tailor/save", { edits: currentEdits(), company });
+      const resp = await postJSON("/tailor/save", { edits: currentEdits(), company, filename });
       save.disabled = false;
       if (resp.error) { estatus.textContent = "⚠️ " + resp.error; return; }
       const pdfName = resp.filename.replace(/\.docx$/i, ".pdf");
@@ -895,9 +984,163 @@
       // ...and actually attach it, which is what the button says it does. Caching alone
       // left you to guess that a second ⚡ Autofill run was required.
       const attached = await attachResume();
+      pageTailored = true;                     // a second ⚡ Autofill won't re-tailor this page
       estatus.textContent = `✓ ${resp.filename} saved${resp.pages > 1 ? ` (⚠︎ ${resp.pages} pages)` : ""} · ${attached}`;
       setStatus(attached);
+      if (!opts.auto) return;
+      // Auto run: the résumé is on the form — hand over to the parser, then fill the rest.
+      URL.revokeObjectURL(previewUrl); ov.remove();
+      setStatus(`${attached} · waiting for this site's résumé parser…`);
+      await waitForParser();
+      await fillPass();
     };
+  }
+
+  // ── 🔍 Probe ──────────────────────────────────────────────────────────────────
+  // A STRUCTURAL snapshot of the form in front of you: what controls exist, how they're
+  // labelled, and what our own heuristics currently make of them. It exists so a flow we
+  // don't support yet — LinkedIn Easy Apply's multi-step modal, an odd ATS — gets built
+  // against the real markup instead of guessed selectors.
+  //
+  // VALUES ARE NEVER CAPTURED, only whether a field has one: this file gets read by a
+  // person and lives on disk, and your answers are your business. Same reason the snapshot
+  // is scoped to the open dialog when there is one — a probe of LinkedIn should describe
+  // the apply modal, not the feed behind it.
+  const attr = (el, a) => el.getAttribute(a) || undefined;
+  const clsOf = (el) => (typeof el.className === "string" && el.className.trim() ? el.className.trim().slice(0, 140) : undefined);
+
+  function describeEl(el) {
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    return {
+      tag: el.tagName.toLowerCase(),
+      type: type || undefined,
+      id: el.id || undefined,
+      name: el.name || undefined,
+      aria: attr(el, "aria-label"),
+      describedby: attr(el, "aria-describedby"),
+      role: attr(el, "role"),
+      cls: clsOf(el),
+      label: labelFor(el) || undefined,
+      visible: visible(el),
+      required: el.required || attr(el, "aria-required") === "true" || undefined,
+      options: el.tagName === "SELECT" ? [...el.options].map((o) => txt(o)).slice(0, 40) : undefined,
+      answered: type === "file" ? (el.files || []).length > 0 : !!String(el.value || "").trim(),
+      checked: /^(radio|checkbox)$/.test(type) ? el.checked : undefined,
+    };
+  }
+
+  function probeSnapshot() {
+    const dialog = document.querySelector(DIALOG_SEL);
+    const scope = dialog || document.body;
+    const pick = (sel, cap) => [...scope.querySelectorAll(sel)].slice(0, cap);
+    const slot = resumeSlot();
+    return {
+      at: new Date().toISOString(),
+      url: location.href.split("?")[0],
+      host: location.host,
+      title: document.title.slice(0, 160),
+      // Is this a modal flow, and what is it? Easy Apply's whole shape hangs off this.
+      dialog: dialog
+        ? { tag: dialog.tagName.toLowerCase(), cls: clsOf(dialog), aria: attr(dialog, "aria-label"), labelledby: attr(dialog, "aria-labelledby"), heading: txt(dialog.querySelector("h1, h2, h3")).slice(0, 120) }
+        : null,
+      looks_like_form: looksLikeForm(),
+      // What WE currently see — the gap between this and `inputs` is the bug report.
+      fields: collectFields().map((f) => ({ label: f.label, kind: f.kind, options: f.options, answered: !!readValue(f), anchor: describeEl(f.el) })),
+      inputs: pick("input, select, textarea", 200).map(describeEl),
+      files: fileInputs().map((el) => ({ ...describeEl(el), context: fileContext(el).slice(0, 200), score: resumeScore(el), picked_as_slot: el === slot })),
+      // Multi-step flows are driven by these: Next / Review / Submit live here.
+      buttons: pick('button, [role="button"], input[type="submit"]', 100)
+        .filter(visible)
+        .map((el) => ({ text: txt(el).slice(0, 80), aria: attr(el, "aria-label"), id: el.id || undefined, cls: clsOf(el), disabled: el.disabled || undefined })),
+      resume_slot: slot ? describeEl(slot) : null,
+      counts: { inputs: scope.querySelectorAll("input, select, textarea").length, files: fileInputs().length, buttons: scope.querySelectorAll('button, [role="button"]').length },
+    };
+  }
+
+  async function probeFlow() {
+    const snap = probeSnapshot();
+    setStatus(`🔍 probing ${snap.dialog ? "the open dialog" : "the page"}: ${snap.fields.length} fields, ${snap.files.length} uploads…`);
+    const r = await postJSON("/probe", { snapshot: snap });
+    if (r.error) {
+      try { await navigator.clipboard.writeText(JSON.stringify(snap, null, 2)); setStatus("⚠️ server down — snapshot copied to clipboard instead"); }
+      catch { setStatus("⚠️ " + r.error + " (and clipboard blocked — see console)"); console.log("[jobfill probe]", snap); }
+      return;
+    }
+    console.log("[jobfill probe]", snap);
+    setStatus(`🔍 saved ${r.file} · ${snap.fields.length} fields · ${snap.buttons.length} buttons`);
+    toast(`🔍 probe saved → applier/probes/${r.file}`);
+  }
+
+  // ── the run: tailor → review → attach → parser → fill ──────────────────────────
+  // ⚡ Autofill does the whole apply sequence in the order a human does it. Tailoring is
+  // skipped — straight to the fill pass — when this page has no upload, when you already
+  // tailored here, or when you said skip. It NEVER tailors blind: with no captured JD you
+  // get the step-1 form (page text prefilled) to check first.
+  let pageTailored = false;     // a tailored résumé is already attached on this page
+  let tailorSkipped = false;    // you chose "just fill the form" here
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Uploading a résumé makes most ATSs prefill the form for you — asynchronously, seconds
+  // later. Filling straight away races that: we'd write into fields the parser then
+  // overwrites, and count about-to-be-filled fields as empty. So wait for the number of
+  // answered fields to stop moving (or `max` ms, whichever comes first).
+  async function waitForParser(max = 9000) {
+    const count = () => collectFields().filter((f) => readValue(f)).length;
+    let prev = count(), stable = 0;
+    for (let t = 0; t < max; t += 500) {
+      await sleep(500);
+      const n = count();
+      if (n === prev) { if (++stable >= 3) break; } else { stable = 0; prev = n; }
+    }
+    return prev;
+  }
+
+  // Straight into the review modal on the JD captured back on LinkedIn/the dashboard —
+  // no step-1 form, because Autofill already knows the job. Same overlay shell tailorFlow
+  // builds, handed to renderReview the moment the model answers.
+  async function tailorAuto(c) {
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font:13px system-ui";
+    ov.innerHTML =
+      `<div id="jf-ebox" style="background:#0f172a;color:#e2e8f0;padding:16px;border-radius:12px;width:min(760px,94vw);max-height:90vh;overflow:auto">` +
+      `<div style="font-weight:600;margin-bottom:6px">Tailoring résumé to this job…</div>` +
+      `<div style="opacity:.75;margin-bottom:10px">📋 ${esc(c.company || "cached JD")}${c.title ? ` · ${esc(c.title)}` : ""} <span style="opacity:.6">(${esc(c.source || "linkedin")}, ${agoText(c.at)})</span> — DeepSeek is drafting edits and rendering the PDF (~10s). You'll review and name it before anything is attached.</div>` +
+      `<div style="display:flex;gap:8px;justify-content:flex-end">` +
+        `<button id="jf-aedit" style="cursor:pointer;background:#334155;color:#fff;border:0;border-radius:6px;padding:6px 12px">Use a different JD</button>` +
+        `<button id="jf-askip" style="cursor:pointer;background:#334155;color:#fff;border:0;border-radius:6px;padding:6px 12px">Skip → fill form</button>` +
+      `</div></div>`;
+    document.body.appendChild(ov);
+
+    let cancelled = false;
+    const stop = (then) => { cancelled = true; ov.remove(); then(); };
+    ov.querySelector("#jf-askip").onclick = () => stop(() => {
+      tailorSkipped = true;
+      setStatus("tailoring skipped — filling fields…");
+      fillPass().catch((e) => setStatus("error: " + e.message));
+    });
+    ov.querySelector("#jf-aedit").onclick = () => stop(() => tailorFlow({ auto: true }));
+
+    const r = await postJSON("/tailor", { jd: c.jd });
+    if (cancelled) return;
+    if (r.error) {
+      ov.remove();
+      setStatus("⚠️ tailor: " + r.error);
+      tailorFlow({ auto: true });               // step 1, so you can retry or skip
+      return;
+    }
+    renderReview(ov, r, c.company || "", c.title || "", { auto: true });
+  }
+
+  async function autofill() {
+    if (pageTailored || tailorSkipped) return fillPass();
+    if (!resumeSlot()) { setStatus("no résumé upload here — filling fields only"); return fillPass(); }
+    const c = jdGet();
+    if (c && c.jd && c.jd.trim().length >= 200) return tailorAuto(c);
+    // No captured JD. Never tailor blind off an ATS form page's own text — open step 1 with
+    // it prefilled so you can check/paste the real description (or skip to filling).
+    setStatus("no cached JD — check the description, then tailor");
+    tailorFlow({ auto: true });
   }
 
   // ── the fill pass ─────────────────────────────────────────────────────────────
@@ -916,7 +1159,10 @@
     return true;
   }
 
-  async function autofill() {
+  // The fill pass: attach whatever résumé is cached (a no-op if one is already on the
+  // form), then answer every field still empty. This is the second half of a run — the
+  // whole of it when there's nothing to tailor.
+  async function fillPass() {
     let fast = 0, files = 0;
     const ask = [];   // fields needing the LLM
 
@@ -1018,7 +1264,9 @@
 
   // ── panel — shows only on application forms ────────────────────────────────────
   function looksLikeForm() {
-    const f = [...document.querySelectorAll("input, textarea, select")].filter(visible);
+    // visible() reads getBoundingClientRect — layout. Cap it: no real application form has
+    // 400 inputs, but a feed page can, and this runs on every DOM mutation batch.
+    const f = [...formRoot().querySelectorAll("input, textarea, select")].slice(0, 400).filter(visible);
     const hasFile = fileInputs().length > 0;   // NOT via visible() — résumé inputs are hidden by design
     const hasEmail = f.some((x) => (x.type || "").toLowerCase() === "email" || /\bemail\b/.test(hayOf(x)));
     const hasName = f.some((x) => /first name|last name|full name|your name/.test(hayOf(x)));
@@ -1060,16 +1308,17 @@
     if (mini) mini.remove();
     const box = document.createElement("div");
     box.style.cssText = "position:fixed;bottom:16px;right:16px;z-index:2147483646;background:#0f172a;color:#e2e8f0;font:12px/1.4 system-ui,-apple-system,sans-serif;padding:10px 12px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.35);max-width:340px";
-    const btn = (id, label, primary) => `<button id="${id}" style="cursor:pointer;background:${primary ? "#2563eb" : "#334155"};color:#fff;border:0;border-radius:6px;padding:5px ${primary ? 10 : 8}px;${primary ? "font-weight:600" : ""}">${label}</button>`;
+    const btn = (id, label, primary, title) => `<button id="${id}"${title ? ` title="${title}"` : ""} style="cursor:pointer;background:${primary ? "#2563eb" : "#334155"};color:#fff;border:0;border-radius:6px;padding:5px ${primary ? 10 : 8}px;${primary ? "font-weight:600" : ""}">${label}</button>`;
     box.innerHTML =
       `<div style="font-weight:600;margin-bottom:6px">Autofill <span style="opacity:.55">· ${location.host}</span></div>` +
       `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">` +
-      btn("jf-fill", "⚡ Autofill", true) + btn("jf-tailor", "📝 Tailor") + btn("jf-pick", "📎 Attach existing") + btn("jf-insights", "📊 Insights") + btn("jf-prof", "⚙ Knowledge") +
+      btn("jf-fill", "⚡ Autofill", true, "tailor to the cached JD → review &amp; name it → attach → fill the rest") + btn("jf-tailor", "📝 Tailor", false, "tailor only — don\'t continue into filling") + btn("jf-pick", "📎 Attach existing") + btn("jf-probe", "🔍 Probe", false, "dump this form\'s STRUCTURE (never your answers) to applier/probes/") + btn("jf-insights", "📊 Insights") + btn("jf-prof", "⚙ Knowledge") +
       `</div><div id="jf-status" style="margin-top:6px;opacity:.85">Ready · ${Object.keys(profile.facts).length} facts · ${profile.qa.length} Q&A</div>`;
     document.body.appendChild(box); statusEl = box.querySelector("#jf-status");
     box.querySelector("#jf-fill").onclick = () => autofill().catch((e) => setStatus("error: " + e.message));
-    box.querySelector("#jf-tailor").onclick = tailorFlow;
+    box.querySelector("#jf-tailor").onclick = () => tailorFlow();
     box.querySelector("#jf-pick").onclick = () => pickResumeFlow().catch((e) => setStatus("error: " + e.message));
+    box.querySelector("#jf-probe").onclick = () => probeFlow().catch((e) => setStatus("probe error: " + e.message));
     box.querySelector("#jf-insights").onclick = insightsFlow;
     box.querySelector("#jf-prof").onclick = editProfile;
   }
@@ -1090,7 +1339,20 @@
 
   let tries = 0;
   const timer = setInterval(() => { if (looksLikeForm()) panel(); if (shown || ++tries > 20) { clearInterval(timer); miniTab(); } }, 1500);
-  new MutationObserver(() => { if (!shown && looksLikeForm()) panel(); }).observe(document.documentElement, { childList: true, subtree: true });
+  // An SPA like LinkedIn mutates the DOM continuously — running looksLikeForm() (which reads
+  // layout for every input) on every batch is the other half of the freeze. Coalesce to one
+  // check per 400ms, and stop observing entirely once the panel is up.
+  let formCheckTimer = null;
+  const formObserver = new MutationObserver(() => {
+    if (shown) { formObserver.disconnect(); return; }
+    if (formCheckTimer) return;
+    formCheckTimer = setTimeout(() => {
+      formCheckTimer = null;
+      if (shown) { formObserver.disconnect(); return; }
+      if (looksLikeForm()) panel();
+    }, 400);
+  });
+  formObserver.observe(document.documentElement, { childList: true, subtree: true });
   miniTab();
 
   // JD capture — run now, then poll (LinkedIn loads the description async and is a
@@ -1100,7 +1362,10 @@
   captureLinkedInJd();
   let lastUrl = location.href;
   setInterval(() => {
-    if (location.href !== lastUrl) { lastUrl = location.href; lastCapturedJobId = ""; }
+    if (location.href !== lastUrl) {
+      lastUrl = location.href; lastCapturedJobId = "";
+      pageTailored = false; tailorSkipped = false;   // new page → the run starts over
+    }
     captureLinkedInJd();
   }, 1500);
 })();

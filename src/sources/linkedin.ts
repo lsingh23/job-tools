@@ -1,6 +1,7 @@
 import * as cheerio from "cheerio";
 import { CONFIG } from "../../config.js";
 import { politeFetch } from "../http.js";
+import { isReachableFromIndia } from "../geo.js";
 import type { Job } from "../types.js";
 import type { Source } from "./base.js";
 
@@ -51,14 +52,31 @@ function stripHtml(s: string): string {
  * title-only data rather than dropping the job or crashing the run.
  * Returns the count successfully enriched.
  */
-export async function enrichLinkedInJobs(jobs: Job[]): Promise<number> {
+export interface EnrichOpts {
+  /**
+   * Called with each job the instant its JD lands, before the loop moves on.
+   * This is what makes a mid-run alert possible: the batch pipeline can't score
+   * anything until every fetch is done (~16 min), but a single job is fully
+   * scoreable the moment its own description arrives. Errors are swallowed —
+   * an alert must never take down the enrich loop.
+   */
+  onEnriched?: (job: Job) => Promise<void> | void;
+  /** Gate priority for the detail fetches (see politeFetch). */
+  priority?: number;
+}
+
+export async function enrichLinkedInJobs(jobs: Job[], opts: EnrichOpts = {}): Promise<number> {
   const dsel = CONFIG.linkedinDetailSelectors;
   let enriched = 0;
   for (const job of jobs) {
     const id = job.externalId.replace(/^linkedin:/, "");
     const url = `${CONFIG.endpoints.linkedinDetail}${id}`;
     try {
-      const html = await politeFetch(url, { cacheKey: `li-detail:${id}`, label: `linkedin detail ${id}` });
+      const html = await politeFetch(url, {
+        cacheKey: `li-detail:${id}`,
+        label: `linkedin detail ${id}`,
+        priority: opts.priority,
+      });
       const $ = cheerio.load(html);
       const desc = stripHtml($(dsel.description).html() ?? "");
       if (desc) job.description = desc;
@@ -96,7 +114,13 @@ export async function enrichLinkedInJobs(jobs: Job[]): Promise<number> {
         if (recruiterName) job.hrName = recruiterName;
       }
 
-      if (desc) enriched++;
+      if (desc) {
+        enriched++;
+        if (opts.onEnriched) {
+          try { await opts.onEnriched(job); }
+          catch (e) { console.warn(`    (onEnriched failed for ${id}: ${e instanceof Error ? e.message : String(e)})`); }
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`    (enrich skipped for ${id}: ${msg})`);
@@ -148,6 +172,13 @@ export const linkedinSource: Source = {
 
             const company = card.find(sel.company).text().trim();
             const location = card.find(sel.location).text().trim();
+            // GEO GATE — the guest endpoint drops `geoId` once the in-geo pool
+            // for this query runs dry and pads the page with worldwide results.
+            // The card's own location is the authority. See src/geo.ts.
+            if (!isReachableFromIndia(location)) {
+              console.log(`    geo-drop: ${title} @ ${location}`);
+              return;
+            }
             const dt = card.find(sel.date).attr("datetime");
             const cleanUrl = href ? href.split("?")[0]! : `https://www.linkedin.com/jobs/view/${id}`;
 
