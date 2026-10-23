@@ -16,3 +16,4 @@ applier/applications.json
 
 # Probe snapshots — local DOM dumps for building ATS support
 applier/probes/
+.model-cache/
