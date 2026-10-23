@@ -15,6 +15,7 @@
 import { execFile } from "node:child_process";
 import { platform } from "node:os";
 import { CONFIG } from "../config.js";
+import { summarizeDirectApply, type DirectApplySignals } from "./direct-apply.js";
 
 /** AppleScript string literal: escape backslashes and double quotes. */
 function esc(s: string): string {
@@ -108,6 +109,37 @@ export async function notifyHotJob(job: {
     subtitle: job.company || undefined,
     body: [job.location, "job-tools"].filter(Boolean).join(" · "),
     sound: CONFIG.notify.hotSound,
+  });
+}
+
+/**
+ * Alert for a DIRECT-APPLY job — one that names a person to write to, or asks
+ * for an immediate joiner (src/direct-apply.ts).
+ *
+ * Unlike notifyHotJob this has NO score gate of its own beyond
+ * CONFIG.directApply.minScore (0 by default): the whole point is that a
+ * low-ranked posting with a recruiter's inbox in it still earns the interrupt.
+ * Its sound is different again, so you can tell the three banner types apart
+ * without looking: run-summary (Glass), strong match (Hero), direct (Submarine).
+ *
+ * The "don't repeat yourself" gate lives in surface.ts — this only ever fires
+ * for a genuinely new DB row.
+ */
+export async function notifyDirectApplyJob(job: {
+  title: string;
+  company?: string;
+  score: number;
+  directApply?: DirectApplySignals;
+}): Promise<void> {
+  if (!CONFIG.notify.enabled || !CONFIG.directApply.enabled) return;
+  const s = job.directApply;
+  if (!s) return;
+  const what = s.emails.length ? s.emails[0]! : summarizeDirectApply(s, 2);
+  await notify({
+    title: `📩 ${what}`.slice(0, 120),
+    subtitle: [job.company, `${job.score}%`].filter(Boolean).join(" · "),
+    body: job.title.slice(0, 160),
+    sound: CONFIG.directApply.sound,
   });
 }
 

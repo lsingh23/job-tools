@@ -19,6 +19,7 @@ import { CONFIG } from "../config.js";
 import { fetchLinkedInCards, runPipeline, type LinkedInLocation } from "./pipeline.js";
 import { fetchNaukriCards } from "./naukri-cards.js";
 import { writeCsv } from "./csv.js";
+import { hiddenOnDashboard } from "./filter.js";
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -119,7 +120,7 @@ async function main() {
         enriched:         stats.enriched,
         final:            stats.final,
       },
-      jobs,
+      jobs: jobs.filter((j) => !hiddenOnDashboard(j)),
     }) + "\n",
   );
 }

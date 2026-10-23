@@ -11,6 +11,7 @@
  * row-by-row upsert is perfectly fine and keeps the mapping obvious.
  */
 
+import net from "node:net";
 import pg from "pg";
 import type { ScoredJob } from "./types.js";
 
@@ -28,6 +29,12 @@ export function getPool(): pg.Pool {
   }
   // Neon requires TLS; its pooled URL carries `sslmode=require`. node-postgres
   // needs the ssl option set explicitly (it doesn't honour sslmode from the URL).
+  // Node's happy-eyeballs gives each resolved address only 250ms to finish the
+  // TCP handshake before trying the next. A handshake to Neon us-east-1 from
+  // here takes ~280-350ms, so EVERY address (3 v4 + 3 v6) times out and pg
+  // surfaces an AggregateError with an empty message — the "[db] … failed ()"
+  // retries, even though the host is perfectly reachable. Give each attempt 2s.
+  net.setDefaultAutoSelectFamilyAttemptTimeout(2_000);
   const needsSsl = /neon\.tech|sslmode=require/.test(connectionString);
   pool = new pg.Pool({
     connectionString,
@@ -54,6 +61,14 @@ export function getPool(): pg.Pool {
 }
 
 /** Connection-level failures that a retry on a fresh socket can plausibly fix. */
+/** AggregateError (multi-address connect failure) has an empty message; show its parts. */
+function errText(err: unknown): string {
+  if (err instanceof AggregateError && !err.message) {
+    return err.errors.map((e) => (e as { code?: string }).code ?? String(e)).join(", ") || "AggregateError";
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 function isTransient(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code;
   if (code && ["ETIMEDOUT", "ECONNRESET", "EPIPE", "ENOTFOUND", "ECONNREFUSED", "EHOSTUNREACH",
@@ -81,7 +96,7 @@ async function withRetry<T>(what: string, fn: () => Promise<T>): Promise<T> {
       if (!isTransient(err) || attempt === 2) throw err;
       const wait = 500 * 2 ** attempt;
       process.stderr.write(
-        `[db] ${what} failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait}ms\n`,
+        `[db] ${what} failed (${errText(err)}) — retrying in ${wait}ms\n`,
       );
       await sleep(wait);
     }
@@ -189,6 +204,13 @@ export async function initSchema(): Promise<void> {
     -- does — a bare score can't distinguish "React+TS and nothing else" from
     -- "React+TS+Next+Tailwind+TanStack+Playwright+Vercel".
     ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stack      jsonb;
+    -- "Send your CV to hr@…" / "Immediate joiner" / a raw address in the JD
+    -- (src/direct-apply.ts). NOT a quality signal and NOT tied to score: it
+    -- marks the postings you can answer by writing to a person. Indexed
+    -- partially because the interesting query is always "show me the hits".
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS direct_apply jsonb;
+    CREATE INDEX IF NOT EXISTS jobs_direct_apply_idx ON jobs (run_date)
+      WHERE direct_apply IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS runs (
       id            serial PRIMARY KEY,
@@ -298,6 +320,7 @@ export async function upsertJobs(
           opts.runDate, j.jdMissing ?? false,
           j.baseScore ?? j.score ?? null, JSON.stringify(j.penalties ?? []),
           JSON.stringify({ hits: j.stackHits ?? [], bonus: j.stackBonus ?? 0, anchored: j.stackAnchored ?? false, pure: j.stackPure ?? false }),
+          j.directApply ? JSON.stringify(j.directApply) : null,
         );
       }
       const res = await client.query(
@@ -305,8 +328,9 @@ export async function upsertJobs(
            external_id, source, title, company, location, url, description,
            posted_at, salary, experience, remote, score, tfidf_score, seniority,
            apply_type, applicants, hr_name, hr_profile_url, salary_band, presence,
-           tags, cities, run_date, jd_missing, base_score, penalties, stack
-         ) VALUES ${placeholders(batch.length, 27)}
+           tags, cities, run_date, jd_missing, base_score, penalties, stack,
+           direct_apply
+         ) VALUES ${placeholders(batch.length, 28)}
          ON CONFLICT (external_id) DO UPDATE SET
            title          = EXCLUDED.title,
            company        = EXCLUDED.company,
@@ -345,6 +369,11 @@ export async function upsertJobs(
                                  THEN EXCLUDED.penalties ELSE jobs.penalties END,
            stack          = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
                                  THEN EXCLUDED.stack ELSE jobs.stack END,
+           -- Same rule as penalties/stack: only a sighting that actually READ
+           -- the JD may rewrite this. A card re-seen without its description
+           -- must not erase the contact details an earlier read found.
+           direct_apply   = CASE WHEN NULLIF(EXCLUDED.description, '') IS NOT NULL
+                                 THEN EXCLUDED.direct_apply ELSE jobs.direct_apply END,
            last_seen_at   = now()
          RETURNING external_id, (xmax = 0) AS inserted`,
         values,
@@ -440,7 +469,8 @@ export async function getJobsForDate(date: string): Promise<Record<string, unkno
     `SELECT external_id, source, title, company, location, url,
             posted_at, salary, experience, remote, score, tfidf_score, seniority,
             apply_type, applicants, hr_name, hr_profile_url, salary_band, presence,
-            cities, jd_missing, base_score, penalties, stack, first_seen_at, last_seen_at
+            cities, jd_missing, base_score, penalties, stack, direct_apply,
+            first_seen_at, last_seen_at
        FROM jobs
       WHERE run_date = $1
       ORDER BY score DESC NULLS LAST, last_seen_at DESC`,

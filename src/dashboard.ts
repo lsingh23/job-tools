@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { CONFIG } from "../config.js";
 import { initSchema, getJobsForDate, getRunsForDate, today } from "./db.js";
@@ -12,9 +12,25 @@ import { notify, notifyCollectDone, notifyCollectFailed } from "./notify.js";
 import { runHotCheck, hotHistory } from "./hot.js";
 import { runNaukriHotCheck, naukriHotHistory } from "./naukri-hot.js";
 import { gateStats } from "./http.js";
+import { hiddenOnDashboard } from "./filter.js";
 
 const PORT = Number(process.env.PORT ?? 5173);
 const OUTPUT_DIR = resolve(CONFIG.output.dir);
+
+/**
+ * "Clear all" on Today's jobs is a VIEW reset, not a delete: we remember the
+ * moment you cleared and hide every row first seen before it. The jobs stay in
+ * Neon; anything collected after the clear shows up as normal.
+ */
+const VIEW_STATE = join(OUTPUT_DIR, "dashboard-state.json");
+async function readClearedAt(): Promise<string | null> {
+  try { return (JSON.parse(await readFile(VIEW_STATE, "utf8")).clearedAt as string) ?? null; }
+  catch { return null; }
+}
+async function writeClearedAt(clearedAt: string | null): Promise<void> {
+  await mkdir(OUTPUT_DIR, { recursive: true });
+  await writeFile(VIEW_STATE, JSON.stringify({ clearedAt }));
+}
 
 /** Minimal RFC-4180-ish CSV parser (handles quotes, embedded commas/newlines). */
 function parseCsv(text: string): string[][] {
@@ -353,11 +369,22 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/today") {
       const date = url.searchParams.get("date") || today();
       try {
-        const [jobs, runs] = await Promise.all([getJobsForDate(date), getRunsForDate(date)]);
-        json(res, 200, { date, jobs, runs, running });
+        const [jobs, runs, clearedAt] = await Promise.all([getJobsForDate(date), getRunsForDate(date), readClearedAt()]);
+        const cut = clearedAt ? new Date(clearedAt).getTime() : 0;
+        const shown = jobs.filter((j) => !hiddenOnDashboard(j));
+        const kept = shown.filter((j) => new Date(j.first_seen_at as string).getTime() > cut);
+        json(res, 200, { date, jobs: kept, clearedAt, clearedCount: shown.length - kept.length, runs, running });
       } catch (err) {
         json(res, 500, { error: `DB error: ${err instanceof Error ? err.message : String(err)}` });
       }
+      return;
+    }
+
+    // ── Clear / restore Today's view (DB untouched) ───────────────────────────
+    if (req.method === "POST" && (url.pathname === "/api/today/clear" || url.pathname === "/api/today/restore")) {
+      const clearedAt = url.pathname.endsWith("/clear") ? new Date().toISOString() : null;
+      await writeClearedAt(clearedAt);
+      json(res, 200, { clearedAt });
       return;
     }
 
@@ -481,7 +508,12 @@ const server = createServer(async (req, res) => {
       const sse = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
       running = true;
-      runCollection({ trigger: "manual", log: (...a) => sse({ type: "log", text: a.join(" ") }) })
+      runCollection({
+        trigger: "manual",
+        hours: CONFIG.collect.manual.windowHours,
+        pages: CONFIG.collect.manual.pages,
+        log: (...a) => sse({ type: "log", text: a.join(" ") }),
+      })
         .then((r) => sse({ type: "result", ...r }))
         .catch((err) => sse({ type: "error", text: err instanceof Error ? err.message : String(err) }))
         .finally(() => { running = false; res.end(); });
@@ -582,6 +614,9 @@ const PAGE = /* html */ `<!doctype html>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   pre { font-family: 'Menlo','Monaco','Consolas',monospace; }
+  /* Already-opened job / HR links turn purple so you can see what you've
+     looked at. Outranks Tailwind's single-class text-blue-600. */
+  a[target="_blank"]:visited { color: #7e22ce; }
 </style>
 </head>
 <body class="bg-slate-50 text-slate-800 text-sm">
@@ -609,6 +644,7 @@ const PAGE = /* html */ `<!doctype html>
       <input id="todayFilter" placeholder="Filter title / company…" oninput="renderToday()"
         class="ml-auto text-sm border border-slate-200 rounded-lg px-3 py-1.5 w-56 focus:outline-none focus:border-slate-400" />
       <button id="collectBtn" onclick="runCollect()"
+        title="Sweep every city over the last ${CONFIG.collect.manual.windowHours}h (auto runs only look back ${CONFIG.collect.windowHours}h)."
         class="px-4 py-1.5 rounded-lg bg-emerald-600 text-white font-medium hover:bg-emerald-500 disabled:opacity-40 transition-all text-sm">
         Run all cities now
       </button>
@@ -643,12 +679,37 @@ const PAGE = /* html */ `<!doctype html>
            were 30 of the 40 chips in this row. -->
       <div id="abroadChips" class="hidden flex-wrap gap-1.5 pl-[4.5rem]"></div>
       <div class="flex flex-wrap items-center gap-2">
+        <span class="w-16 shrink-0 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Apply</span>
+        <div id="applyChips" class="flex flex-wrap gap-1.5"></div>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="w-16 shrink-0 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Contact</span>
+        <div id="contactChips" class="flex flex-wrap gap-1.5"></div>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
         <span class="w-16 shrink-0 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Source</span>
         <div id="sourceChips" class="flex flex-wrap gap-1.5"></div>
-        <label class="ml-auto flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
+        <label class="ml-auto flex items-center gap-1.5 text-xs text-fuchsia-700 cursor-pointer select-none"
+               title="Only postings whose JD names someone to write to (&quot;send your CV to …&quot;, an email address) or asks for an immediate joiner. These are highlighted in fuchsia and always shown regardless of match %.">
+          <input id="directOnly" type="checkbox" onchange="renderToday()" class="accent-fuchsia-600" />
+          &#128233; Direct apply <span id="directCount" class="tabular-nums text-fuchsia-400"></span>
+        </label>
+        <label class="flex items-center gap-1.5 text-xs text-amber-700 cursor-pointer select-none"
+               title="Only postings that ask for an immediate / urgent joiner (&quot;immediate joiner&quot;, &quot;urgent hiring&quot;, &quot;0-15 days&quot;, …). Hover a row's &#9201; badge to see the matched phrase.">
+          <input id="immediateOnly" type="checkbox" onchange="renderToday()" class="accent-amber-600" />
+          &#9201; Immediate only <span id="immediateCount" class="tabular-nums text-amber-400"></span>
+        </label>
+        <label class="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none">
           <input id="groupByCity" type="checkbox" onchange="renderToday()" class="accent-slate-700" />
           Group by city
         </label>
+        <button onclick="restoreToday()" id="todayRestore"
+                class="hidden text-xs text-slate-500 hover:text-slate-800 underline"></button>
+        <button onclick="clearToday()"
+                title="Hide every job currently collected. Only hides them here — nothing is deleted from the database. New jobs still appear."
+                class="px-2.5 py-1 rounded-md text-xs font-medium border border-rose-200 text-rose-600 hover:bg-rose-50">
+          Clear all
+        </button>
       </div>
     </div>
 
@@ -1173,9 +1234,26 @@ async function loadToday() {
   }
   todayLoadError = null;
   todayJobs = data.jobs || [];
+  const rb = $("todayRestore");
+  if (data.clearedAt && data.clearedCount) {
+    rb.textContent = "Show " + data.clearedCount + " cleared";
+    rb.classList.remove("hidden");
+  } else {
+    rb.classList.add("hidden");
+  }
   todayRuns = data.runs || [];
   renderRunsStrip(todayRuns, data.running);
   renderToday();
+}
+
+async function clearToday() {
+  if (!confirm("Hide all jobs currently on the dashboard? (Nothing is deleted from the database; new jobs will still appear.)")) return;
+  await fetch("/api/today/clear", { method: "POST" });
+  loadToday();
+}
+async function restoreToday() {
+  await fetch("/api/today/restore", { method: "POST" });
+  loadToday();
 }
 
 // Fold line for Today's jobs — a display threshold, NOT a filter. Injected from
@@ -1194,6 +1272,8 @@ let fPosted  = 24;           // "all" | max age in HOURS of the posting itself
 let fTime    = "all";        // "all" | "run" (latest run) | hours as a number
 let fCities  = new Set();    // empty = every city; "__remote__" is a pseudo-city
 let fSources = new Set();    // empty = every source
+let fApply   = "all";        // "all" | "easy_apply" | "external" | "other" (no apply_type known)
+let fContact = "all";        // "all" | "yes" | "no" — same test the Contact column uses
 
 // ── Where a job actually is ───────────────────────────────────────────────────
 //
@@ -1310,15 +1390,24 @@ function jobIsAbroad(j) {
   const p = canonPlace(String(j.location || ""));
   return p ? p.abroad : false;     // pure-remote counts as reachable, not abroad
 }
-// "Remote" arrives three ways — the row's own flag, a location string, and the
-// search city it was found under (CONFIG names that one "Remote (India)"). All
-// three mean the same thing to a reader, so they fold into one chip; without
-// this the day splits into a "Remote" chip and a near-duplicate "Remote (India)"
-// city chip that overlap.
+// CONFIRMED remote: the posting itself said so, via its own flag or its own
+// location text. The 'cities' array is deliberately NOT consulted — it records
+// which SEARCH found the job, and one of those searches is literally named
+// "Remote (India)". Folding that in (as this did until 2026-09-18) told the
+// reader an ordinary Delhi office job was Remote, because LinkedIn's guest
+// f_WT=2 facet pads its results with non-remote jobs once the real remote pool
+// runs dry. The sweep is a place to look, not a fact about the job.
 const REMOTE_RE = /remote|work from home|wfh|anywhere|distributed/i;
 function isRemote(j) {
-  return j.remote === true || REMOTE_RE.test(String(j.location || "")) ||
-    (j.cities || []).some((c) => REMOTE_RE.test(String(c)));
+  return j.remote === true || REMOTE_RE.test(String(j.location || ""));
+}
+// UNCONFIRMED: only the remote sweep says so. Rendered as a grey "Remote?" and
+// counted under its real city chip, never under Remote. Note that LinkedIn
+// exposes no workplace type at all to a logged-out client (no field on the
+// guest detail page, no JSON-LD), so for a LinkedIn row this stays unresolvable
+// short of opening the posting — which is exactly what the "?" is telling you.
+function isRemoteMaybe(j) {
+  return !isRemote(j) && (j.cities || []).some((c) => REMOTE_RE.test(String(c)));
 }
 
 // Cutoff for the "When" axis. "run" = the newest run's start, i.e. "what the last
@@ -1365,6 +1454,22 @@ function passPlace(j) {
 function passSource(j) {
   return !fSources.size || fSources.has(j.source);
 }
+// apply_type is only ever easy_apply / external (LinkedIn enrichment); every
+// other source, and an unenriched LinkedIn card, is null → "other".
+function applyKind(j) {
+  return j.apply_type === "easy_apply" || j.apply_type === "external" ? j.apply_type : "other";
+}
+function passApply(j) {
+  return fApply === "all" || applyKind(j) === fApply;
+}
+// "Has contact" = what the Contact column would show something for: an address
+// found in the JD, or the recruiter's name from the posting.
+function hasContact(j) {
+  return !!((j.direct_apply && (j.direct_apply.emails || []).length) || j.hr_name);
+}
+function passContact(j) {
+  return fContact === "all" || (fContact === "yes") === hasContact(j);
+}
 
 // Expanded state of the "+N abroad" chip row. Collapsing it also clears any
 // abroad filter that was active, so the row can never be hidden AND filtering.
@@ -1386,6 +1491,8 @@ function toggleCity(c)   { fCities.has(c)  ? fCities.delete(c)  : fCities.add(c)
 function toggleSource(s) { fSources.has(s) ? fSources.delete(s) : fSources.add(s); renderToday(); }
 function clearPlace()  { fCities.clear();  renderToday(); }
 function clearSource() { fSources.clear(); renderToday(); }
+function setApply(v)   { fApply = v; renderToday(); }
+function setContact(v) { fContact = v; renderToday(); }
 
 function chip(label, count, active, onclick, extraCls) {
   return '<button onclick="' + onclick + '" class="px-2.5 py-1 rounded-full border text-xs transition-all ' +
@@ -1398,10 +1505,28 @@ function chip(label, count, active, onclick, extraCls) {
 // Counts on each chip are computed with that chip's OWN axis left out, so a
 // number never reads as 0 just because you already narrowed the same axis.
 function renderChips() {
-  const bySource = todayJobs.filter((j) => passPosted(j) && passTime(j) && passPlace(j));
-  const byPlace  = todayJobs.filter((j) => passPosted(j) && passTime(j) && passSource(j));
-  const byTime   = todayJobs.filter((j) => passPosted(j) && passPlace(j) && passSource(j));
-  const byPosted = todayJobs.filter((j) => passTime(j) && passPlace(j) && passSource(j));
+  const pa = (j) => passApply(j) && passContact(j);
+  const bySource  = todayJobs.filter((j) => passPosted(j) && passTime(j) && passPlace(j) && pa(j));
+  const byPlace   = todayJobs.filter((j) => passPosted(j) && passTime(j) && passSource(j) && pa(j));
+  const byTime    = todayJobs.filter((j) => passPosted(j) && passPlace(j) && passSource(j) && pa(j));
+  const byPosted  = todayJobs.filter((j) => passTime(j) && passPlace(j) && passSource(j) && pa(j));
+  const base      = (j) => passPosted(j) && passTime(j) && passPlace(j) && passSource(j);
+  const byApply   = todayJobs.filter((j) => base(j) && passContact(j));
+  const byContact = todayJobs.filter((j) => base(j) && passApply(j));
+
+  const nApply = (k) => byApply.filter((j) => applyKind(j) === k).length;
+  $("applyChips").innerHTML = [
+    chip("All", byApply.length, fApply === "all", "setApply('all')"),
+    chip("Easy Apply", nApply("easy_apply"), fApply === "easy_apply", "setApply('easy_apply')"),
+    chip("Company Site", nApply("external"), fApply === "external", "setApply('external')"),
+    chip("Other / unknown", nApply("other"), fApply === "other", "setApply('other')"),
+  ].join("");
+  const withContact = byContact.filter(hasContact).length;
+  $("contactChips").innerHTML = [
+    chip("All", byContact.length, fContact === "all", "setContact('all')"),
+    chip("Has contact", withContact, fContact === "yes", "setContact('yes')"),
+    chip("No contact", byContact.length - withContact, fContact === "no", "setContact('no')"),
+  ].join("");
 
   const postedIn = (h) => byPosted.filter((j) => {
     const age = postedAgeHours(j);
@@ -1519,7 +1644,10 @@ const TODAY_COLS = ["Score", "Title", "Company", "Location", "Posted", "Exp", "A
 // shown by default; the tail is one click away, with its penalties visible.
 // Above the fold: scored well, OR unread but with a title that itself matched
 // core skills ("React Developer" with no JD yet) — those are worth a click.
-const aboveFold = (j) => (j.score || 0) >= LOW_RANK || (j.jd_missing && (j.score || 0) > 0);
+// A direct-apply hit is ALWAYS above the fold, whatever it scored. Hiding a
+// posting that hands you a recruiter's inbox behind "show low-ranked" defeats
+// the entire point of detecting it — the value is the open channel, not the match.
+const aboveFold = (j) => (j.score || 0) >= LOW_RANK || (j.jd_missing && (j.score || 0) > 0) || !!j.direct_apply;
 
 function scoreClass(s) {
   if (s >= 70) return "bg-emerald-50 text-emerald-700";
@@ -1533,11 +1661,43 @@ function todayRow(j) {
     : j.apply_type === "external"
       ? '<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">Company Site</span>'
       : '<span class="text-slate-300">—</span>';
-  const hr = j.hr_name
+  // Direct-apply (src/direct-apply.ts): this JD names a person to write to, or
+  // asks for an immediate joiner. Deliberately NOT folded into the score badge —
+  // it answers a different question ("can I reach a human right now?") — so it
+  // gets fuchsia, a colour used nowhere else in this table, and the row itself
+  // is tinted rather than just a cell, because you should spot it while scrolling.
+  const da = j.direct_apply || null;
+  const daHits = (da && da.hits) || [];
+  const daEmails = (da && da.emails) || [];
+  const daKinds = daHits.map(function (h) { return h.kind; });
+  const daLabel = daEmails.length ? "&#128233; EMAIL"
+    : daKinds.indexOf("contact") !== -1 ? "&#128233; SEND CV"
+    : "&#9201; IMMEDIATE";
+  // Tooltip shows the matched phrase IN CONTEXT: "immediate joiner" in a JD and
+  // "immediate joiner" in the title are worth different amounts of attention,
+  // and a phrase match you can't see the source of is one you can't trust.
+  const daTip = daHits.map(function (h) {
+    return h.kind.toUpperCase() + " in " + h.where + " — " + h.label + "\\n" + h.excerpt;
+  }).join("\\n\\n");
+  const daBadge = da
+    ? '<span class="ml-2 align-middle px-1.5 py-0.5 rounded text-[10px] font-semibold tracking-wide bg-fuchsia-100 text-fuchsia-700 cursor-help" title="' +
+      escHtml(daTip) + '">' + daLabel + '</span>'
+    : "";
+
+  // Contact column: the address beats the recruiter's profile link when both
+  // exist — it is the thing you actually act on. Shown as a mailto so the row
+  // is one click from a reply.
+  const mails = daEmails.slice(0, 2).map(function (e) {
+    return '<a class="text-fuchsia-700 font-medium hover:underline" href="mailto:' + escHtml(e) + '">' + escHtml(e) + '</a>';
+  }).join('<span class="text-slate-300"> · </span>');
+  const hrName = j.hr_name
     ? (j.hr_profile_url
         ? '<a class="text-blue-600 hover:underline" target="_blank" href="' + escHtml(j.hr_profile_url) + '">' + escHtml(j.hr_name) + '</a>'
         : escHtml(j.hr_name))
-    : '<span class="text-slate-300">—</span>';
+    : "";
+  const hr = mails
+    ? mails + (hrName ? '<span class="ml-1.5 text-slate-400">' + hrName + '</span>' : "")
+    : (hrName || '<span class="text-slate-300">—</span>');
   // Applicants since posted — the LinkedIn detail page's "N applicants" text,
   // captured at enrich time (see enrichLinkedInJobs) and stored on the row.
   const applicants = j.applicants
@@ -1590,6 +1750,9 @@ function todayRow(j) {
   const place = isRemote(j)
     ? '<span class="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[11px]">Remote</span>' +
       (loc && !REMOTE_RE.test(loc) ? '<span class="ml-1.5 text-slate-400 text-xs">' + escHtml(loc) + '</span>' : "")
+    : isRemoteMaybe(j)
+    ? '<span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 text-[11px]" title="Found by the remote-only search, but the posting itself never says remote — LinkedIn hides work type from logged-out visitors. Check the link.">Remote?</span>' +
+      (loc ? '<span class="ml-1.5 text-slate-400 text-xs">' + escHtml(loc) + '</span>' : "")
     : '<span class="text-slate-400 text-xs">' + escHtml(loc || "—") + '</span>';
 
   // Age of the POSTING. Its own column because it was invisible before, and
@@ -1606,10 +1769,12 @@ function todayRow(j) {
         '>' + fmtAge(ageH) + (exact ? "" : "*") + '</span>';
 
   const tr = document.createElement("tr");
-  tr.className = "border-b border-slate-100 hover:bg-blue-50/40 transition-colors";
+  tr.className = da
+    ? "border-b border-fuchsia-200 bg-fuchsia-50 hover:bg-fuchsia-100/70 transition-colors"
+    : "border-b border-slate-100 hover:bg-blue-50/40 transition-colors";
   tr.innerHTML =
     '<td class="py-2.5 pr-5 pl-3 whitespace-nowrap">' + scoreCell + '</td>' +
-    '<td class="py-2.5 pr-5 min-w-[16rem] max-w-md"><a class="text-blue-600 hover:underline font-medium line-clamp-1" target="_blank" href="' + escHtml(j.url || "#") + '">' + escHtml(j.title || "") + '</a>' + src + '</td>' +
+    '<td class="py-2.5 pr-5 min-w-[16rem] max-w-md"><a class="text-blue-600 hover:underline font-medium line-clamp-1" target="_blank" href="' + escHtml(j.url || "#") + '">' + escHtml(j.title || "") + '</a>' + src + daBadge + '</td>' +
     '<td class="py-2.5 pr-5 text-slate-700 whitespace-nowrap">' + escHtml(j.company || "") + '</td>' +
     '<td class="py-2.5 pr-5 whitespace-nowrap">' + place + '</td>' +
     '<td class="py-2.5 pr-5 whitespace-nowrap">' + ageCell + '</td>' +
@@ -1629,12 +1794,30 @@ function groupHeaderRow(label, n) {
   return tr;
 }
 
+// "Immediate" = a direct-apply urgency hit (CONFIG.directApply.urgencyPhrases:
+// "immediate joiner", "urgent hiring", "0-15 days" …), independent of whether
+// the JD also carries an email / send-CV line.
+function isImmediate(j) {
+  const hits = (j.direct_apply && j.direct_apply.hits) || [];
+  return hits.some(function (h) { return h.kind === "urgency"; });
+}
+
 function renderToday() {
   renderChips();
   const q = ($("todayFilter").value || "").toLowerCase();
-  const scoped = todayJobs.filter((j) => passPosted(j) && passTime(j) && passPlace(j) && passSource(j));
+  const scoped = todayJobs.filter((j) => passPosted(j) && passTime(j) && passPlace(j) && passSource(j) && passApply(j) && passContact(j));
+  // Counted over the facet-filtered set, NOT the post-toggle list, so the number
+  // answers "how many are there right now" not "how many survived my own toggle".
+  const nDirect = scoped.filter((j) => !!j.direct_apply).length;
+  $("directCount").textContent = nDirect ? "(" + nDirect + ")" : "";
+  const nImmediate = scoped.filter(isImmediate).length;
+  $("immediateCount").textContent = nImmediate ? "(" + nImmediate + ")" : "";
+  const directOnly = $("directOnly").checked;
+  const immediateOnly = $("immediateOnly").checked;
   const jobs = scoped.filter((j) =>
-    !q || (j.title || "").toLowerCase().includes(q) || (j.company || "").toLowerCase().includes(q));
+    (!directOnly || !!j.direct_apply) &&
+    (!immediateOnly || isImmediate(j)) &&
+    (!q || (j.title || "").toLowerCase().includes(q) || (j.company || "").toLowerCase().includes(q)));
   const narrowed = jobs.length !== todayJobs.length;
   $("todayCount").textContent = todayJobs.length
     ? (narrowed ? "(" + jobs.length + " shown · " + todayJobs.length + " today)"
@@ -1647,7 +1830,7 @@ function renderToday() {
     // Never claim the day is empty when we simply have no data to show.
     if (todayLoadError) { $("todayEmpty").textContent = todayLoadError; return; }
     $("todayEmpty").textContent = todayJobs.length
-      ? "Nothing matches these filters — widen the Posted / Found / Where / Source chips above."
+      ? "Nothing matches these filters — widen the Posted / Found / Where / Apply / Contact / Source chips above."
       : "No jobs collected yet today — click “Run all cities now”, or wait for the next scheduled run.";
     return;
   }

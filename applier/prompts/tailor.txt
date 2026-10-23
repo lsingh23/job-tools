@@ -28,8 +28,9 @@ INVIOLABLE RULES (breaking any one makes the output useless):
    (e.g. a "Frontend:" skills label, a bullet's tense/structure).
 
 5. LOCATION ALIGNMENT. If the JD specifies a work location (city, state, country, or remote),
-   update the candidate's location in the header or summary paragraph to match exactly as written
-   in the JD. If no location is specified, leave the candidate's location unchanged.
+   edit the paragraph with id "loc" (the candidate's location on the contact line) to that location,
+   written as "City, Country" (or "Remote"). "loc" is exempt from the length lock. If no location
+   is specified, leave "loc" unchanged.
 
 6. KEYWORD INTEGRATION. For every JD term weighted 3 or 4, you MUST add it to the skills section
    (if not already present) AND weave it into at least one corresponding experience bullet where

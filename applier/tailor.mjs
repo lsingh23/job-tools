@@ -59,7 +59,9 @@ export async function tailor(jd, masterPath) {
     seenIds.add(id);
     const orig = byId.get(id);
     if (!next || next === orig) continue;
-    if (!withinLength(orig, next)) { rejected.push({ id, reason: "length", old_text: orig, new_text: next }); continue; }
+    // The location is a short "City, Country" token on the contact line — exempt from the
+    // paragraph length lock (it's one tab-stopped cell), just capped so it can't overflow the line.
+    if (id === "loc" ? next.length > 40 : !withinLength(orig, next)) { rejected.push({ id, reason: "length", old_text: orig, new_text: next }); continue; }
     edits.push({ id, old_text: orig, new_text: next });
   }
 

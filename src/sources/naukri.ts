@@ -130,18 +130,32 @@ export const naukriSource: Source = {
             const key = `naukri:${j.jobId}`;
             if (seen.has(key)) continue;
             seen.add(key);
+
+            // Naukri's location placeholder can be "Remote", "On-site",
+            // "Hybrid" or a city, and it is the ONLY thing consulted here.
+            // `loc` (the search location, one of which is "Remote") must never
+            // stand in for it: inheriting the sweep is what made LinkedIn call
+            // Delhi office jobs Remote (see readWorkArrangement in
+            // sources/linkedin.ts). Naukri does honour `location=Remote` today
+            // — 137/137 cards across 3 keywords came back labelled Remote,
+            // none missing (2026-09-18) — so this costs nothing now and stops
+            // the day the filter starts leaking like LinkedIn's does.
+            const ownLocation = placeholder(j, "location");
+            const location = ownLocation ?? loc;
+            const isRemote = ownLocation !== null && /remote/i.test(ownLocation) && !/hybrid/i.test(ownLocation);
+
             out.push({
               source: "naukri",
               externalId: key,
               title: j.title,
               company: j.companyName ?? "",
-              location: placeholder(j, "location") ?? loc,
+              location,
               url: absoluteUrl(j.jdURL, j.jobId),
               description: `${j.jobDescription ?? ""} ${j.tagsAndSkills ?? ""}`.trim(),
               postedAt: j.createdDate ? new Date(j.createdDate).toISOString() : null,
               salary: placeholder(j, "salary"),
               experience: placeholder(j, "experience"),
-              remote: /remote/i.test(loc),
+              remote: isRemote,
               tags: (j.tagsAndSkills ?? "").split(",").map((s) => s.trim()).filter(Boolean),
             });
           }

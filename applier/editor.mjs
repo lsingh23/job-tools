@@ -13,12 +13,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readDocumentXml, writePatchedDocx, paragraphs,
-  rebuildParagraph, rebuildLabelledParagraph, firstRun, xmlUnesc,
+  rebuildParagraph, rebuildLabelledParagraph, firstRun, xmlUnesc, xmlEsc, withHighlightRpr,
 } from "./docx.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-// Master résumé lives in the project root (one dir up from applier/).
-const MASTER = process.env.MASTER_RESUME ?? path.join(HERE, "..", "Lakhveer Singh Resume.docx");
+// Master résumé the tailor edits: the rebuilt version in applier/tailored/. The previous master
+// (project root "Lakhveer Singh Resume.docx") is kept on disk for reference but no longer used.
+const MASTER = process.env.MASTER_RESUME ?? path.join(HERE, "tailored", "Lakhveer Singh Resume - Rebuilt.docx");
 
 const SECTION_HEADERS = ["SUMMARY", "SKILLS", "WORK EXPERIENCE", "EDUCATION", "PROJECTS", "CERTIFICATIONS", "ACHIEVEMENTS"];
 const headerOf = (t) => {
@@ -42,6 +43,20 @@ const firstRunBold = (xml) => {
 const looksLabelled = (para) =>
   firstRunBold(para.xml) && /^[^:\n]{1,32}:\s*$/.test(firstRunText(para.xml));
 
+// The contact line's location: the first plain <w:t> reading like "City, Country" (not inside a
+// hyperlink, not a phone/email). Edited in place — only that <w:t>'s text changes, so the
+// paragraph's hyperlinks and every other run stay byte-for-byte intact.
+export const LOC_ID = "loc";
+const LOC_RE = /^\s*[A-Za-z][A-Za-z .'-]*,\s*[A-Za-z][A-Za-z .'-]*\s*$/;
+function locationRun(paraXml) {
+  const outside = paraXml.replace(/<w:hyperlink[\s>][\s\S]*?<\/w:hyperlink>/g, "");
+  for (const m of outside.matchAll(/(<w:t[^>]*>)([^<]*)(<\/w:t>)/g)) {
+    const raw = xmlUnesc(m[2]);
+    if (LOC_RE.test(raw)) return { tag: m[0], open: m[1], close: m[3], raw, text: raw.trim() };
+  }
+  return null;
+}
+
 /**
  * Read the master and return editable rows + full text.
  * @returns {{
@@ -61,6 +76,16 @@ export function extractRows(masterPath = MASTER) {
     textParts.push(p.text);
     const h = headerOf(p.text);
     if (h) { section = h; rows.push({ id: `p${i}`, section, kind: "header", text: p.text }); return; }
+    // A paragraph with a <w:hyperlink> (contact line: GitHub/LinkedIn/Portfolio) must never go
+    // through rebuildParagraph — it only re-emits plain <w:r> runs from the first run's rPr, so
+    // an "edit" here would silently drop the hyperlink relationships and render as plain text.
+    if (/<w:hyperlink[\s>]/.test(p.xml)) {
+      rows.push({ id: `p${i}`, section, kind: "header", text: p.text });
+      // …but its "City, Country" run is plain text, so expose just that run as the "loc" row.
+      const loc = locationRun(p.xml);
+      if (loc) rows.push({ id: LOC_ID, section, kind: "text", text: loc.text });
+      return;
+    }
     rows.push({ id: `p${i}`, section, kind: "text", text: p.text });
   });
 
@@ -82,7 +107,9 @@ export function saveEdited(edits, destPath, masterPath = MASTER, opts = {}) {
   const paras = paragraphs(xml); // same order as extractRows → index maps to id
 
   const byIndex = new Map();
+  let locText = null;
   for (const e of Array.isArray(edits) ? edits : []) {
+    if (e?.id === LOC_ID && typeof e.text === "string" && e.text.trim()) { locText = e.text.trim(); continue; }
     const m = /^p(\d+)$/.exec(String(e?.id || ""));
     if (!m || typeof e.text !== "string") continue;
     byIndex.set(Number(m[1]), e.text);
@@ -99,6 +126,23 @@ export function saveEdited(edits, destPath, masterPath = MASTER, opts = {}) {
       : rebuildParagraph(p.xml, newText, { highlight, oldText: p.text });
     // Replace this exact paragraph occurrence (paragraphs can repeat, so replace positionally).
     out = replaceNth(out, p.xml, rebuilt, occurrencesBefore(paras, i));
+  }
+
+  if (locText !== null) {
+    const contact = paras.find((p) => /<w:hyperlink[\s>]/.test(p.xml) && locationRun(p.xml));
+    const loc = contact && locationRun(contact.xml);
+    if (loc && locText !== loc.text) {
+      // Keep the run's leading/trailing whitespace (the tab stop that spaces the contact line).
+      const lead = loc.raw.match(/^\s*/)[0], trail = loc.raw.match(/\s*$/)[0];
+      const newT = loc.open + xmlEsc(lead + locText + trail) + loc.close;
+      const run = contact.xml.match(/<w:r(?:\s[^>]*)?>(?:(?!<\/w:r>)[\s\S])*?<\/w:r>/g).find((r) => r.includes(loc.tag));
+      let newRun = run.replace(loc.tag, newT);
+      if (highlight) {
+        const rPr = (newRun.match(/<w:rPr>[\s\S]*?<\/w:rPr>/) ?? [""])[0];
+        newRun = rPr ? newRun.replace(rPr, withHighlightRpr(rPr)) : newRun.replace(/^<w:r(?:\s[^>]*)?>/, (o) => o + withHighlightRpr(""));
+      }
+      out = out.replace(contact.xml, contact.xml.replace(run, newRun));
+    }
   }
 
   return writePatchedDocx(masterPath, out, destPath);

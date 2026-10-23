@@ -36,27 +36,58 @@ interface NaukriCard {
 const nkPlaceholder = (j: NaukriCard, type: string): string | null =>
   j.placeholders?.find((p) => p.type === type)?.label ?? null;
 
+/** One keyword and how deep to page it. See buildQueries(). */
+export interface NaukriQuery {
+  keyword: string;
+  pages: number;
+}
+
 export interface FetchNaukriOpts {
   hours: number;
-  pages: number;
-  terms: string[];
+  /** Pages per term. Ignored when `queries` is given (each query names its own depth). */
+  pages?: number;
+  /** Keywords to iterate at `pages` deep. Ignored when `queries` is given. */
+  terms?: string[];
+  /**
+   * Explicit query plan, overriding `terms` x `pages`. Lets a caller mix
+   * keyword SHAPES at different depths — see CONFIG.naukriHot.skillQuery for
+   * why that matters (a comma skill-list and a bare title phrase hit Naukri's
+   * index differently and surface genuinely different jobs).
+   */
+  queries?: NaukriQuery[];
+  /** Override the window-derived sort. See naukriSort(). */
+  sort?: "r" | "f";
+  /** Override CONFIG.experience.naukriYears for this fetch (null = omit the param). */
+  experience?: number | null;
   /** Gate priority (see politeFetch): 0 = hot checker jumps the queue, 1 = sweep. */
   priority?: number;
   log?: (...a: unknown[]) => void;
 }
 
 /**
- * Sort order follows the WINDOW — see memory "naukri-nkparam-unblock" for the
- * measurement. hours>=24 → "r" (relevance; the day-wide window barely filters
- * so the server ranking decides what you see). hours<24 → "f" (freshest;
- * newest-first makes the in-window cards exactly the first N, so a few pages
- * + early-stop captures the whole window without wasting pages).
+ * DEFAULT sort order, when the caller doesn't pass one. Follows the WINDOW —
+ * see memory "naukri-nkparam-unblock" for the measurement. hours>=24 → "r"
+ * (relevance; the day-wide window barely filters so the server ranking decides
+ * what you see). hours<24 → "f" (freshest; newest-first makes the in-window
+ * cards exactly the first N, so a few pages + early-stop captures the whole
+ * window without wasting pages).
+ *
+ * That sub-day default is right for a WIDE window (6h+), where the window
+ * genuinely holds more cards than the page budget. It is wrong for the hot
+ * checker, which is why naukri-hot.ts overrides it — measured 2026-09-04:
+ * a 15-minute window contains ZERO Naukri cards nationwide (60m: 0-2,
+ * 180m: 0-8), so there is no coverage for "f" to protect there, and its
+ * unranked page 1 is simply whichever agency bulk-posted last. Same terms,
+ * same page budget, 24h window: "f" yielded 5 jobs scoring >=70, "r" yielded 9.
  */
 function naukriSort(hours: number): "r" | "f" {
   return hours >= 24 ? "r" : "f";
 }
 
-function naukriUrl(keyword: string, location: string, page: number, hours: number): string {
+function naukriUrl(
+  keyword: string, location: string, page: number, hours: number,
+  sort: "r" | "f", experience: number | null,
+): string {
   const p = new URLSearchParams({
     noOfResults: "20",
     urlType: "search_by_key_loc",
@@ -66,22 +97,24 @@ function naukriUrl(keyword: string, location: string, page: number, hours: numbe
     location,
     l: location,
     pageNo: String(page),
-    sort: naukriSort(hours),
+    sort,
     jobAge: String(Math.max(1, Math.ceil(hours / 24))),
   });
-  // Off by default — see CONFIG.experience.naukriYears for why (it brackets bands,
-  // so it deletes wide/senior-banded frontend roles). filter.ts cuts seniority.
-  if (CONFIG.experience.naukriYears !== null) p.set("experience", String(CONFIG.experience.naukriYears));
+  // Off by default for the wide collector — see CONFIG.experience.naukriYears.
+  // The hot checker passes it explicitly (measured: it halves the bulk-agency
+  // rows without costing anything at the top of the ranking).
+  if (experience !== null) p.set("experience", String(experience));
   return `${CONFIG.endpoints.naukri}?${p.toString()}`;
 }
 
 /** Cards for one Naukri page, or null at end-of-results for this keyword. */
 async function fetchNaukriPage(
-  keyword: string, location: string, page: number, hours: number, first: boolean, priority?: number,
+  keyword: string, location: string, page: number, hours: number, first: boolean,
+  sort: "r" | "f", experience: number | null, priority?: number,
 ): Promise<Job[] | null> {
   let body: string;
   try {
-    body = await politeFetch(naukriUrl(keyword, location, page, hours), {
+    body = await politeFetch(naukriUrl(keyword, location, page, hours, sort, experience), {
       noDelay: first,
       priority,
       headers: { ...CONFIG.naukriHeaders, nkparam: mintNkparam(), Accept: "application/json" },
@@ -116,6 +149,9 @@ async function fetchNaukriPage(
       title: j.title,
       company: j.companyName ?? "",
       location: nkPlaceholder(j, "location") ?? location,
+      // NB: `?? location` above is the SEARCH location and is display-only —
+      // `remote` below reads the card's own label and nothing else. See the
+      // note in sources/naukri.ts.
       url: j.jdURL
         ? (/^https?:\/\//.test(j.jdURL) ? j.jdURL : `https://www.naukri.com${j.jdURL.startsWith("/") ? "" : "/"}${j.jdURL}`)
         : `https://www.naukri.com/job-listings-${j.jobId}`,
@@ -123,7 +159,10 @@ async function fetchNaukriPage(
       postedAt: Number.isFinite(postedMs) ? new Date(postedMs).toISOString() : null,
       salary: nkPlaceholder(j, "salary"),
       experience: nkPlaceholder(j, "experience"),
-      remote: /remote/i.test(nkPlaceholder(j, "location") ?? location),
+      remote: (() => {
+        const own = nkPlaceholder(j, "location");
+        return own !== null && /remote/i.test(own) && !/hybrid/i.test(own);
+      })(),
       tags: (j.tagsAndSkills ?? "").split(",").map((s) => s.trim()).filter(Boolean),
       applicants: null,
     }];
@@ -135,20 +174,26 @@ async function fetchNaukriPage(
  *
  * Naukri's `jobAge` is day-granular, so sub-day windows are applied here off
  * `createdDate`. The early-stop (bail on a keyword the moment a page goes
- * stale) is valid ONLY under sort=f (hours<24) — see naukriSort() above; it
- * must stay in step with that or it silently loses results.
+ * stale) is valid ONLY under sort=f, where the page order IS time order — so
+ * it is keyed off the EFFECTIVE sort, not off `hours`. Under sort=r a stale
+ * card says nothing about the cards after it, and stopping there silently
+ * drops the rest of the ranking.
  */
 export async function fetchNaukriCards(location: string, opts: FetchNaukriOpts): Promise<Job[]> {
   const log = opts.log ?? (() => {});
-  const canEarlyStop = naukriSort(opts.hours) === "f";
+  const sort = opts.sort ?? naukriSort(opts.hours);
+  const experience = opts.experience !== undefined ? opts.experience : CONFIG.experience.naukriYears;
+  const queries: NaukriQuery[] =
+    opts.queries ?? (opts.terms ?? []).map((keyword) => ({ keyword, pages: opts.pages ?? 1 }));
+  const canEarlyStop = sort === "f";
   const cutoff = Date.now() - opts.hours * 3600_000;
   const seen = new Set<string>();
   const out: Job[] = [];
   let stale = 0;
   let first = true;
-  for (const kw of opts.terms) {
-    keyword: for (let p = 1; p <= opts.pages; p++) {
-      const cards = await fetchNaukriPage(kw, location, p, opts.hours, first, opts.priority);
+  for (const { keyword: kw, pages } of queries) {
+    keyword: for (let p = 1; p <= pages; p++) {
+      const cards = await fetchNaukriPage(kw, location, p, opts.hours, first, sort, experience, opts.priority);
       first = false;
       if (cards === null) { log(`  naukri "${kw}" @ ${location} p${p}: end of results`); break; }
       let fresh = 0;
@@ -169,6 +214,7 @@ export async function fetchNaukriCards(location: string, opts: FetchNaukriOpts):
       log(`  naukri "${kw}" @ ${location} p${p}: ${cards.length} cards, ${fresh} within ${opts.hours}h`);
     }
   }
-  log(`[naukri] ${stale} cards outside the ${opts.hours}h window dropped`);
+  log(`[naukri] sort=${sort}${experience !== null ? ` exp=${experience}` : ""}, ${queries.length} queries, ` +
+      `${out.length} kept, ${stale} outside the ${opts.hours}h window`);
   return out;
 }

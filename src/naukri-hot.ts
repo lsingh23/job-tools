@@ -6,9 +6,13 @@
  *
  * Same idea as src/hot.ts (LinkedIn), simpler in practice: Naukri cards carry
  * a real `createdDate` timestamp and the full JD inline, so there's no enrich
- * step and no "is this actually fresh" uncertainty — `sort=f` + a narrow
- * client-side time window (src/naukri-cards.ts) directly IS the freshest
- * slice of the market, not a proxy for it.
+ * step and no "is this actually fresh" uncertainty.
+ *
+ * This tick does NOT sort by freshness. Naukri's newest-first ordering is
+ * unranked, so page 1 is whichever staffing agency bulk-posted last, and two
+ * pages of it are one agency's catalogue. It asks for RELEVANCE within the
+ * last day instead, over a 3h window, and leans on seen_cards to decide what
+ * is actually new. See CONFIG.naukriHot for the measurements.
  *
  * SHARING NAUKRI WITH THE WIDE COLLECTOR: both loops go through the same
  * per-host gate (CONFIG.http.gates["www.naukri.com"]), so Naukri sees one
@@ -18,7 +22,7 @@
 
 import { CONFIG } from "../config.js";
 import { runPipeline } from "./pipeline.js";
-import { fetchNaukriCards } from "./naukri-cards.js";
+import { fetchNaukriCards, type NaukriQuery } from "./naukri-cards.js";
 import { getSeenCards, recordSeenCards, upsertJobs, today, initSchema } from "./db.js";
 import { surfaceHotJob } from "./surface.js";
 import type { ScoredJob } from "./types.js";
@@ -67,12 +71,20 @@ export async function runNaukriHotCheck(opts: { log?: (...a: unknown[]) => void 
     const memory = { lookup: getSeenCards, record: recordSeenCards };
     const terms = nh.terms ?? [...CONFIG.linkedinSearchTerms];
 
+    // Skill query first (it carries the ranking), then the title terms shallow
+    // for the tail it misses. See CONFIG.naukriHot.skillQuery for the numbers.
+    const queries: NaukriQuery[] = [
+      { keyword: nh.skillQuery, pages: nh.skillPages },
+      ...terms.map((keyword) => ({ keyword, pages: nh.termPages })),
+    ];
+
     const cardLists = await Promise.all(
       nh.locations.map((loc) =>
         fetchNaukriCards(loc, {
           hours: nh.windowMinutes / 60,
-          pages: nh.pages,
-          terms,
+          queries,
+          sort: nh.sort,
+          experience: nh.experience,
           priority: 0, // jump the wide collector's queue
           log: (...a) => log("  ", ...a),
         }),

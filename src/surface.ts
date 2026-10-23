@@ -18,13 +18,17 @@
  */
 
 import { upsertJobs } from "./db.js";
-import { notifyHotJob } from "./notify.js";
+import { notifyHotJob, notifyDirectApplyJob } from "./notify.js";
+import { shouldAlertDirect, summarizeDirectApply } from "./direct-apply.js";
+import { CONFIG } from "../config.js";
 import type { ScoredJob } from "./types.js";
 
 export interface SurfaceResult {
   /** True when this call created the row (and therefore fired the alert). */
   isNew: boolean;
   alerted: boolean;
+  /** The banner fired because the JD names a human to contact, not on score. */
+  direct?: boolean;
 }
 
 export async function surfaceHotJob(
@@ -40,7 +44,18 @@ export async function surfaceHotJob(
   const isNew = insertedIds.includes(job.externalId);
   if (!isNew) return { isNew: false, alerted: false };
 
+  // Two independent reasons to shout, and a job can qualify on either. The
+  // direct-apply banner wins the sound when both fire — "here is an inbox to
+  // write to" is more actionable than "this scored well", and a single job
+  // must never produce two banners.
+  const direct = shouldAlertDirect(job);
+  if (direct) {
+    await notifyDirectApplyJob(job);
+    log(`📩 ${job.score}% "${job.title}" @ ${job.company} — ${summarizeDirectApply(job.directApply!)} — ${job.url}`);
+    return { isNew: true, alerted: true, direct: true };
+  }
+
   await notifyHotJob(job);
   log(`🔔 ${job.score}% "${job.title}" @ ${job.company} — ${job.url}`);
-  return { isNew: true, alerted: true };
+  return { isNew: true, alerted: job.score >= CONFIG.notify.hotScore };
 }

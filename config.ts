@@ -690,6 +690,10 @@ export const CONFIG = {
    */
   blockedCompanies: [
     "infosys",
+    "careerxperts consulting",
+    "versatile club employer of record",
+    "scoutit",
+    "sme careers",
   ],
 
   /**
@@ -1005,6 +1009,15 @@ K6LgzJhmLhN7B5yuEyaKoasgXQk3+OQglsOaBxEJ0j5PcTL3nbOvt80CAwEAAQ==
     /** Listing pages per keyword per city. Kept low — sortBy=DD puts fresh on top. */
     pages: 2,
     /**
+     * The dashboard's manual "Run all cities now" button. Unlike the 30-min
+     * auto runs (which only need to cover the gap since the last one), a manual
+     * run is a catch-up sweep, so it looks back over the whole last 24h for
+     * every city. More pages because a 24h window holds far more cards than 2
+     * pages × 10 can show; paging stops early once a query runs out, and
+     * `skipSeenHours` keeps already-judged cards from being re-enriched.
+     */
+    manual: { windowHours: 24, pages: 5 },
+    /**
      * Local-clock window the scheduler is allowed to auto-run, inclusive on both
      * ends, as "HH:MM" on the half-hour grid. "09:30"–"21:00" with
      * `intervalMinutes: 30` = 24 runs/day at 9:30, 10:00, 10:30 … 21:00.
@@ -1155,9 +1168,18 @@ K6LgzJhmLhN7B5yuEyaKoasgXQk3+OQglsOaBxEJ0j5PcTL3nbOvt80CAwEAAQ==
      * (like `hot.windowMinutes`) so overlap makes a missed posting impossible
      * rather than unlikely — re-seen cards cost nothing (seen_cards skips
      * them without a request), only the genuinely new ones do any work.
+     *
+     * MUST stay wide now that `sort` is "r". Under sort=f the page order WAS
+     * time order, so a 15-minute cutoff and a 15-minute page budget described
+     * the same set. Under relevance ordering they do not: the ranking returns
+     * the best of the last DAY (jobAge is day-granular), so a 15-minute
+     * client-side cutoff would throw almost all of it away — measured, a
+     * 15-minute window holds ZERO cards nationwide. 3h is the scale where real
+     * supply shows up (0-8 cards) while seen_cards still does the actual
+     * "is this new to me" work. Narrowing this without also reverting `sort`
+     * silently empties every tick.
      */
-    windowMinutes: 15,
-    pages: 2,
+    windowMinutes: 180,
     /** null = reuse CONFIG.linkedinSearchTerms (same terms the wide Naukri collector uses). */
     terms: null as string[] | null,
     /**
@@ -1178,6 +1200,47 @@ K6LgzJhmLhN7B5yuEyaKoasgXQk3+OQglsOaBxEJ0j5PcTL3nbOvt80CAwEAAQ==
     activeWindow: null as { start: string; end: string } | null,
     /** Ticks kept in memory for the dashboard's /api/naukri-hot panel. */
     historySize: 40,
+
+    /**
+     * RELEVANCE, not freshness — the hot checker overrides the sub-day default
+     * in src/naukri-cards.ts naukriSort(). Measured 2026-09-04 (24h window, the
+     * cities in locations.naukri, scored by the real scorer + filter):
+     *
+     *   5 title terms, sort=f, no exp, 2pg   57 req →  5 jobs >=70  (page 1 = one agency)
+     *   5 title terms, sort=r, exp=3,  2pg   70 req →  9 jobs >=70
+     *   skill query,   sort=r, exp=3,  3pg   19 req → 11 jobs >=70
+     *   BOTH (below),  sort=r, exp=3         54 req → 12 jobs >=70
+     *
+     * The coverage argument for sort=f does not apply at this cadence: a
+     * 15-minute window holds ZERO Naukri cards nationwide (60m: 0-2, 180m:
+     * 0-8), so 3 pages of relevance covers hours of real supply. Under sort=f
+     * page 1 is just whichever agency bulk-posted last.
+     */
+    sort: "r" as "r" | "f",
+
+    /**
+     * Naukri reads a COMMA-SEPARATED list as a skills query against its own
+     * taxonomy; a bare title phrase ("React Developer") gets fuzzy-OR'd into
+     * `React OR Developer` and drags in Java/Python/AI roles. The skill query
+     * is by far the most efficient single query we have (11 jobs >=70 in 19
+     * requests) — but it is NOT a superset of the title terms, which is why
+     * both still run: measured, Digitide's "React Developer" was found ONLY by
+     * the title terms and never by the skill query. Do not drop either half.
+     */
+    skillQuery: "frontend, react.js, react",
+    /** Pages for `skillQuery` — it carries the ranking, so it gets the depth. */
+    skillPages: 3,
+    /** Pages per title term. Shallow: they are here for the tail the skill query misses. */
+    termPages: 1,
+
+    /**
+     * ON here, unlike the wide collector (CONFIG.experience.naukriYears is null
+     * — see the note there). Measured: halves the bulk-agency rows (62 -> 29)
+     * and cost nothing at the top of the ranking (11 jobs >=70 with it vs 8
+     * without). The recorded 6h-window measurement in memory found the opposite;
+     * that window is not this one, so this stays scoped to the hot path.
+     */
+    experience: 3 as number | null,
   },
 
   /**
@@ -1213,6 +1276,74 @@ K6LgzJhmLhN7B5yuEyaKoasgXQk3+OQglsOaBxEJ0j5PcTL3nbOvt80CAwEAAQ==
     hotScore: 70,
     /** Distinct from the run-summary sound, so a real match is audibly different. */
     hotSound: "Hero",
+  },
+
+  /**
+   * DIRECT-APPLY DETECTION (src/direct-apply.ts) — postings that hand you a
+   * human instead of a form: "send your CV to hr@acme.in", "please share
+   * resume", "Immediate Joiner".
+   *
+   * These alert and get highlighted REGARDLESS of match % — that is the whole
+   * point, and why `minScore` is 0. A 34% posting with a recruiter's inbox in
+   * the body is worth thirty seconds in a way a 34% posting behind a Workday
+   * form is not: the reply comes from a person and the queue is empty. Ranking
+   * answers "does this fit"; this answers "can I reach someone right now", and
+   * the two are independent questions.
+   *
+   * Phrases are matched case-insensitively against title AND body, with spaces
+   * treated as "any whitespace" (JD text arrives with newlines collapsed
+   * unevenly, so a literal-space match misses exactly the posts we want). Add
+   * new wordings to these lists — no code change needed.
+   */
+  directApply: {
+    enabled: true,
+    /**
+     * Score floor for the instant banner. 0 = alert on every direct-apply hit,
+     * however badly it matched. Raise it only if the banners get noisy; the
+     * dashboard highlight is unaffected either way.
+     */
+    minScore: 0,
+    /** Its own sound, so a direct-contact post is audibly not a 70%-match post. */
+    sound: "Submarine",
+    /** Pull addresses out of the JD and show them as mailto links. */
+    detectEmails: true,
+    /**
+     * Placeholder/boilerplate domains only. A recruiter on gmail/outlook is
+     * deliberately NOT filtered — a free-provider address in a JD is the
+     * strongest "a human reads this inbox" signal there is.
+     */
+    ignoreEmailDomains: [
+      "example.com", "example.org", "domain.com", "company.com",
+      "yourcompany.com", "email.com", "linkedin.com", "sentry.io",
+    ],
+    /** "Contact a person to apply" instructions. */
+    contactPhrases: [
+      "send your cv", "send cv", "send your resume", "send resume",
+      "send me your cv", "send me your resume",
+      "share your cv", "share cv", "share your resume", "share resume",
+      "please share resume", "please share your resume", "please share cv",
+      "share your profile", "share profile at", "share your updated resume",
+      "kindly share your resume", "kindly share your cv",
+      "drop your cv", "drop your resume", "drop me your resume",
+      "mail your cv", "mail your resume", "mail me your resume",
+      "email your cv", "email your resume", "email us your resume",
+      "forward your cv", "forward your resume",
+      "dm your resume", "dm me your resume", "dm your cv",
+      "whatsapp your resume", "whatsapp your cv",
+      "interested candidates can share", "interested candidates may share",
+      "interested candidates can send", "interested can share",
+      "apply at", "apply by sending", "to apply send", "reach out at",
+      "contact us at", "write to us at", "revert with your resume",
+    ],
+    /** Urgency wording — usually means the pipeline is open right now. */
+    urgencyPhrases: [
+      "immediate joiner", "immediate joiners", "immediate joining",
+      "immediate joinee", "immediate joinees", "immediately joining",
+      "immediate requirement", "immediate hiring", "urgent hiring",
+      "urgent requirement", "urgently hiring", "urgent opening",
+      "notice period immediate", "can join immediately", "join immediately",
+      "0-15 days", "15 days notice", "serving notice period",
+    ],
   },
 
   /**

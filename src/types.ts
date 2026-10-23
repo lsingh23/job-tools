@@ -1,3 +1,6 @@
+import type { DirectApplySignals } from "./direct-apply.js";
+export type { DirectApplySignals };
+
 /** A normalized job posting, common shape across all sources. */
 export interface Job {
   source: string;
@@ -12,6 +15,13 @@ export interface Job {
   applicants?: string | null; // raw applicant count text from detail page (e.g. "Over 200 applicants")
   experience?: string | null; // required-experience band if disclosed (e.g. "3-7 Yrs")
   remote: boolean;
+  /**
+   * What the POSTING itself said about the arrangement, or null/undefined when
+   * it said nothing. Not persisted — it exists so the JD fallback in
+   * enrichLinkedInJobs can tell "card said On-site" from "card said nothing",
+   * and so `remote` is never inferred from which search sweep found the job.
+   */
+  workArrangement?: "remote" | "onsite" | "hybrid" | null;
   tags: string[];
   applyType?: "easy_apply" | "external" | null; // easy_apply = applies on LinkedIn; external = redirects to company site/ATS
   hrName?: string | null; // recruiter name from "message the recruiter" block, if shown
@@ -67,6 +77,13 @@ export interface ScoredJob extends Job {
   tfidfScore?: number; // 0–1 TF-IDF cosine similarity vs resume (set after enrichment)
   salaryBand?: SalaryBand; // crowd-sourced market band (AmbitionBox), absent if unresolved
   presence?: PresenceSignals; // online-footprint evidence; ONLY set when AmbitionBox had no page
+  /**
+   * "Send your CV to …" / "Immediate joiner" / a raw email address in the JD.
+   * Set by src/direct-apply.ts, and deliberately INDEPENDENT of `score` — it
+   * answers "can I reach a human directly?", not "does this role fit?". Absent
+   * when nothing matched (the common case).
+   */
+  directApply?: DirectApplySignals;
 }
 
 /**

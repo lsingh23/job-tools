@@ -126,6 +126,30 @@ export function jobAgeDays(job: { postedAt?: string | null }): number | null {
   return days < 0 ? null : days;
 }
 
+/**
+ * Dashboard-only hard hide, applied to stored rows at read time (so it also
+ * cleans rows collected before this rule existed). The scorer only PENALISES
+ * these; on the dashboard they are pure noise:
+ *  - asks for ≥ filter.maxRequiredYears (the "needs 5+ yrs" / stretch rows)
+ *  - title is an internship / traineeship (filter.internTitles)
+ *  - company is in CONFIG.blockedCompanies (the pipeline drops these at
+ *    collection, but hot checks / ATS bypass it and older rows predate entries)
+ */
+export function hiddenOnDashboard(row: { title?: unknown; company?: unknown; experience?: unknown; penalties?: unknown }): boolean {
+  const f = CONFIG.filter;
+  if (isBlockedCompany(String(row.company ?? ""))) return true;
+  const title = String(row.title ?? "");
+  if (f.internTitles.some((x) => patternPresent(title, x))) return true;
+  const pens = Array.isArray(row.penalties) ? (row.penalties as Penalty[]) : [];
+  for (const p of pens) {
+    const m = /^needs (\d+)\+ yrs$/.exec(String(p?.label ?? ""));
+    if (m && Number(m[1]) >= f.maxRequiredYears) return true;
+    if (String(p?.label ?? "").startsWith("internship")) return true;
+  }
+  const min = minRequiredYears({ experience: row.experience ? String(row.experience) : undefined } as ScoredJob);
+  return min !== null && min >= f.maxRequiredYears;
+}
+
 /** Company name, normalised for comparison: lowercase, no punctuation or suffixes. */
 function normCompany(name: string): string {
   return (name || "")

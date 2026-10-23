@@ -46,6 +46,54 @@ function stripHtml(s: string): string {
 }
 
 /**
+ * Work arrangement, read off the CARD ITSELF and nothing else.
+ *
+ * Guest cards sometimes prefix the location with the arrangement — "Remote,
+ * Bengaluru, ..." / "On-site, ..." / "Hybrid, ...". That prefix plus a few JD
+ * phrases (see enrichLinkedInJobs) are the ONLY public workplace signals there
+ * are: the guest job-detail page carries no workplace field and no JSON-LD, and
+ * the real Remote/Hybrid/On-site pill renders only behind a login.
+ *
+ * NEVER default this to the search's own f_WT=2 "Remote (India)" sweep. That
+ * facet is advisory on the guest endpoint exactly like `geoId` is — once the
+ * remote pool for a query runs dry LinkedIn pads the page with ordinary office
+ * jobs, and inheriting the sweep's flag stamped those "Remote" (a Delhi-only
+ * Full Stack role at Hudle read as Remote this way, 2026-09-18). Returns null
+ * for "the card didn't say", which callers must treat as NOT remote — the
+ * dashboard renders those as a grey "Remote?" when the remote sweep found them.
+ */
+export function readWorkArrangement(raw: string): {
+  arrangement: "remote" | "onsite" | "hybrid" | null;
+  location: string;
+} {
+  const location = raw.trim();
+  if (/^Remote[,\s]/i.test(location)) {
+    return { arrangement: "remote", location: location.replace(/^Remote[,\s]+/i, "").trim() };
+  }
+  if (/^On-?site[,\s]/i.test(location)) {
+    return { arrangement: "onsite", location: location.replace(/^On-?site[,\s]+/i, "").trim() };
+  }
+  if (/^Hybrid[,\s]/i.test(location)) {
+    // Hybrid is not purely remote, and saying so is the whole point of this file.
+    return { arrangement: "hybrid", location: location.replace(/^Hybrid[,\s]+/i, "").trim() };
+  }
+  return { arrangement: null, location };
+}
+
+/**
+ * JD fallback for the arrangement, used only when the card said nothing.
+ * Deliberately narrow: a bare "remote" matches "remote teams", "remote
+ * debugging" and "remote-first culture of our parent company", so only explicit
+ * arrangement phrases count, and any office phrase anywhere vetoes them.
+ */
+const JD_REMOTE_RE = /\b(fully|100%|completely|permanently)\s+remote\b|\bremote[-\s](first|only|position|role|opportunity)\b|\bwork from home\b|\bwfh\b/i;
+const JD_OFFICE_RE = /\bwork from (the )?office\b|\bin[-\s]office\b|\bon[-\s]?site\b|\bhybrid\b|\bwfo\b/i;
+
+function remoteFromJd(desc: string): boolean {
+  return JD_REMOTE_RE.test(desc) && !JD_OFFICE_RE.test(desc);
+}
+
+/**
  * Enrich a set of LinkedIn jobs in place by fetching each one's guest
  * job-detail page for the full description (+ salary if shown). Each fetch is
  * polite (delay/backoff/cache). A per-job failure is swallowed — we keep the
@@ -80,6 +128,13 @@ export async function enrichLinkedInJobs(jobs: Job[], opts: EnrichOpts = {}): Pr
       const $ = cheerio.load(html);
       const desc = stripHtml($(dsel.description).html() ?? "");
       if (desc) job.description = desc;
+      // Last chance to confirm "Remote" from something the posting actually
+      // says. Only ever upgrades: a card that already said Remote stays Remote,
+      // and a card that said On-site/Hybrid is not overruled by JD prose.
+      if (!job.remote && !job.workArrangement && desc && remoteFromJd(desc)) {
+        job.remote = true;
+        job.workArrangement = "remote";
+      }
       const salary = $(dsel.salary).first().text().trim();
       if (salary) job.salary = salary;
       const applicants = $(dsel.applicants).first().text().trim();
@@ -171,7 +226,11 @@ export const linkedinSource: Source = {
             seen.add(key);
 
             const company = card.find(sel.company).text().trim();
-            const location = card.find(sel.location).text().trim();
+            // The card is the source of truth for the arrangement — never the
+            // search config. See readWorkArrangement().
+            const wa = readWorkArrangement(card.find(sel.location).text());
+            let location = wa.location;
+            const isRemote = wa.arrangement === "remote";
             // GEO GATE — the guest endpoint drops `geoId` once the in-geo pool
             // for this query runs dry and pads the page with worldwide results.
             // The card's own location is the authority. See src/geo.ts.
@@ -194,7 +253,8 @@ export const linkedinSource: Source = {
               description: "",
               postedAt: dt ? new Date(dt).toISOString() : null,
               salary: null, // not exposed on guest cards
-              remote: loc.remote,
+              remote: isRemote,
+              workArrangement: wa.arrangement,
               tags: [],
             });
             added++;

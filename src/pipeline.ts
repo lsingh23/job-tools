@@ -17,7 +17,7 @@ import * as cheerio from "cheerio";
 import { CONFIG } from "../config.js";
 import { politeFetch } from "./http.js";
 import { prefilterByTitle } from "./prefilter.js";
-import { enrichLinkedInJobs } from "./sources/linkedin.js";
+import { enrichLinkedInJobs, readWorkArrangement } from "./sources/linkedin.js";
 import { loadKeywords, loadResumeText } from "./resume.js";
 import { scoreAll, scoreJob, titleRelevance, classifyTitle } from "./scoring.js";
 import { dedupe } from "./dedupe.js";
@@ -27,6 +27,7 @@ import { rankJobs, enrichPriority, isBlockedCompany } from "./filter.js";
 import { enrichWithSalary } from "./salary.js";
 import { enrichWithPresence } from "./presence.js";
 import { isReachableFromIndia } from "./geo.js";
+import { markDirectApply, shouldAlertDirect } from "./direct-apply.js";
 import type { Job, ScoredJob } from "./types.js";
 
 const sel = CONFIG.linkedinSelectors;
@@ -103,7 +104,14 @@ function parseCards(html: string, loc: LinkedInLocation, log?: (...a: unknown[])
   $(sel.card).each((_, el) => {
     const title = $(el).find(sel.title!).text().trim();
     const company = $(el).find(sel.company!).text().trim();
-    const location = $(el).find(sel.location!).text().trim();
+    // WORK-ARRANGEMENT GATE. Same rule as the geo gate below: the CARD is the
+    // authority, never the query. `f_WT=2` on the "Remote (India)" sweep is
+    // advisory on the guest endpoint and gets padded out with ordinary office
+    // jobs once the remote pool runs dry, so inheriting `loc.remote` here
+    // stamped those Remote (Hudle, Delhi-only, 2026-09-18). Unknown = not
+    // remote; the dashboard shows those as "Remote?" instead.
+    const wa = readWorkArrangement($(el).find(sel.location!).text());
+    const location = wa.location;
     const href = $(el).find(sel.link!).attr("href") ?? "";
     const urn = $(el).find(sel.entityUrn!).attr("data-entity-urn") ?? "";
     const idM = urn.match(/(\d{6,})/) ?? href.match(/-(\d{6,})(?:\?|$)/);
@@ -135,7 +143,8 @@ function parseCards(html: string, loc: LinkedInLocation, log?: (...a: unknown[])
       postedAt: null,
       salary: null,
       experience: null,
-      remote: !!loc.remote,
+      remote: wa.arrangement === "remote",
+      workArrangement: wa.arrangement,
       tags: [],
     });
   });
@@ -332,8 +341,16 @@ export async function runPipeline(
     const onEnriched = opts.onScored
       ? async (job: Job) => {
           const [provisional] = rankJobs([scoreJob(job, loadKeywords())]).kept;
-          if (provisional && provisional.score >= CONFIG.notify.hotScore) {
-            log(`[pipeline] ⚡ ${provisional.score}% "${provisional.title}" @ ${provisional.company} — surfacing now`);
+          if (!provisional) return;
+          // Scan the JD the instant it lands. This is the ONLY place a
+          // direct-apply posting can be caught early, and it is deliberately
+          // OR'd with the score gate rather than nested inside it: a "send your
+          // CV to hr@…" job that scores 31% must still surface now, because the
+          // value there is the open inbox, not the match.
+          markDirectApply(provisional);
+          const direct = shouldAlertDirect(provisional);
+          if (provisional.score >= CONFIG.notify.hotScore || direct) {
+            log(`[pipeline] ${direct ? "📩" : "⚡"} ${provisional.score}% "${provisional.title}" @ ${provisional.company} — surfacing now`);
             await opts.onScored!(provisional);
           }
         }
@@ -346,6 +363,19 @@ export async function runPipeline(
   const keywords = loadKeywords();
   const scored = scoreAll(candidates, keywords);
 
+  // 4a. Direct-apply scan over the whole batch (src/direct-apply.ts). Runs here,
+  //     after scoring and before persistence, so EVERY row that reaches the DB
+  //     carries the flag — including ones the streaming hook never saw (JDs
+  //     reused from seen_cards, and every job when onScored isn't wired up).
+  //     Pure string matching over text already in memory: no network, no cost.
+  const directHits = scored.filter((j) => markDirectApply(j));
+  if (directHits.length) {
+    log(`[pipeline] 📩 ${directHits.length} direct-apply posting(s) — contact details or "immediate joiner" in the JD:`);
+    for (const j of directHits.slice(0, 6)) {
+      log(`  📩 ${j.score}% "${j.title}" @ ${j.company} — ${j.directApply!.hits.map((h) => h.label).slice(0, 3).join(", ")}`);
+    }
+  }
+
   // 4b. Streaming surface for sources that skip enrichment (Naukri: cards
   // already carry the full JD, so step 3's onEnriched hook — the only other
   // place onScored fires — never runs and a hot Naukri job would otherwise
@@ -353,8 +383,9 @@ export async function runPipeline(
   // just walk the ones that clear the bar.
   if (!doEnrich && opts.onScored) {
     for (const job of scored) {
-      if (job.score >= CONFIG.notify.hotScore) {
-        log(`[pipeline] ⚡ ${job.score}% "${job.title}" @ ${job.company} — surfacing now`);
+      const direct = shouldAlertDirect(job);
+      if (job.score >= CONFIG.notify.hotScore || direct) {
+        log(`[pipeline] ${direct ? "📩" : "⚡"} ${job.score}% "${job.title}" @ ${job.company} — surfacing now`);
         await opts.onScored(job);
       }
     }

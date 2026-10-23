@@ -72,7 +72,7 @@ function buildAndRender(edits, destDocx, { highlight, keepPdfAt = null }) {
 const toEdits = (arr) =>
   (Array.isArray(arr) ? arr : [])
     .map((e) => ({ id: String(e?.id || ""), text: typeof e?.text === "string" ? e.text : String(e?.new_text ?? "") }))
-    .filter((e) => /^p\d+$/.test(e.id));
+    .filter((e) => /^p\d+$/.test(e.id) || e.id === "loc");
 
 // ── WYSIWYG résumé editor (applier/wysiwyg.html) ────────────────────────────────
 // Editable sources: the master, plus anything already saved in tailored/. A source key is
@@ -82,6 +82,7 @@ function editorSources() {
   if (existsSync(TAILORED_DIR)) {
     const docx = readdirSync(TAILORED_DIR)
       .filter((f) => f.toLowerCase().endsWith(".docx") && !f.startsWith("~$"))
+      .filter((f) => path.join(TAILORED_DIR, f) !== path.resolve(MASTER)) // already listed as "master"
       .map((f) => ({ f, mtime: statSync(path.join(TAILORED_DIR, f)).mtimeMs }))
       .sort((a, b) => b.mtime - a.mtime);
     for (const { f } of docx) out.push({ key: `tailored/${f}`, label: f.replace(/\.docx$/i, "") });
